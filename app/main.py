@@ -1,0 +1,390 @@
+"""FastAPI application: manifest intake, precheck, sealing, diffs, evidence."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Query
+
+from .db import (
+    get_db,
+    get_manifest,
+    get_media,
+    insert_manifest,
+    list_manifests,
+    mark_sealed,
+    save_precheck,
+    configure,
+)
+from .evidence import (
+    build_evidence_package,
+    diff_manifests,
+    package_digest,
+    payload_from_row,
+    report_from_json,
+)
+from .hashing import digest_canonical, linear_sha256, merkle_root
+from .schemas import (
+    DiffReport,
+    EvaluationReport,
+    Finding,
+    ManifestCreate,
+    ManifestCreated,
+    MediaRecord,
+    SealRejected,
+    SealResult,
+    Severity,
+)
+from .verifier import evaluate
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    configure(app.state.db_path)
+    yield
+
+
+app = FastAPI(
+    title="Split-Image Forensic Evidence Verification API",
+    version="1.0.0",
+    description=(
+        "Verify segmented disk acquisitions: sector coverage by offset, "
+        "chunk-order reconstruction, SHA-256/Merkle roots, write-protector "
+        "checks and replica/chain-of-custody digest continuity. Resumes, "
+        "target swaps and corrections can only create new revisions; sealed "
+        "manifests stay read-only."
+    ),
+    lifespan=lifespan,
+)
+app.state.db_path = "data/evidence.db"
+
+
+def _new_manifest_id() -> str:
+    return f"MF-{uuid.uuid4().hex[:12].upper()}"
+
+
+def _attach_lineage_findings(conn: sqlite3.Connection, payload: ManifestCreate,
+                             report: EvaluationReport) -> None:
+    """Cross-revision rules that need prior manifests.
+
+    Source geometry is fixed when a medium is first registered; a revision that
+    changes sector size / sector count / capacity is a mid-acquisition source
+    parameter change and can never be sealed.
+    """
+    media_row = get_media(conn, payload.media.media_id)
+    if media_row is None:
+        return
+    g = payload.media.geometry
+    old = {"sector_size": media_row["sector_size"],
+           "total_sectors": media_row["total_sectors"],
+           "capacity_bytes": media_row["capacity_bytes"]}
+    new = {"sector_size": g.sector_size,
+           "total_sectors": g.total_sectors,
+           "capacity_bytes": g.capacity_bytes}
+    if old != new:
+        report.error(
+            "MEDIA_PARAMETERS_CHANGED",
+            f"medium {payload.media.media_id} geometry differs from the first "
+            f"registered manifest {media_row['first_manifest_id']}",
+            start_sector=0, end_sector=g.total_sectors,
+            detail={"first_manifest_id": media_row["first_manifest_id"],
+                    "registered": old, "submitted": new})
+    has_errors = any(f.severity == Severity.error for f in report.findings)
+    report.sealable = report.sealable and not has_errors
+
+
+def _evaluate_with_lineage(conn: sqlite3.Connection,
+                           payload: ManifestCreate) -> EvaluationReport:
+    report = evaluate(payload)
+    _attach_lineage_findings(conn, payload, report)
+    return report
+
+
+def _summary(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "manifest_id": row["manifest_id"],
+        "revision": row["revision"],
+        "media_id": row["media_id"],
+        "status": row["status"],
+        "change_kind": row["change_kind"],
+        "parent_manifest_id": row["parent_manifest_id"],
+        "superseded_by": row["superseded_by"],
+        "created_at": row["created_at"],
+        "sealed_at": row["sealed_at"],
+    }
+
+
+def _validate_lineage(conn: sqlite3.Connection, payload: ManifestCreate) -> None:
+    media_id = payload.media.media_id
+    existing = list_manifests(conn, media_id)
+    if payload.change_kind == "initial":
+        if existing:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "REVISION_REQUIRED",
+                        "message": "medium already has manifests; resume, target-swap "
+                                   "or correction must create a derived revision",
+                        "latest_manifest_id": existing[-1]["manifest_id"]})
+    else:
+        if not payload.parent_manifest_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "PARENT_REQUIRED",
+                        "message": f"change_kind={payload.change_kind} requires "
+                                   f"parent_manifest_id"})
+        parent = get_manifest(conn, payload.parent_manifest_id)
+        if parent is None:
+            raise HTTPException(status_code=404,
+                                detail=f"parent manifest "
+                                       f"{payload.parent_manifest_id} not found")
+        if parent["media_id"] != media_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "PARENT_MEDIA_MISMATCH",
+                        "message": "parent manifest belongs to another medium",
+                        "parent_media_id": parent["media_id"]})
+        if parent["status"] == "superseded":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PARENT_SUPERSEDED",
+                        "message": "cannot derive from an already superseded "
+                                   "manifest; branch from its current successor",
+                        "superseded_by": parent["superseded_by"]})
+        # A draft parent is allowed (a power-loss partial image can never seal);
+        # inserting the revision supersedes it and freezes it read-only.
+
+
+@app.post("/manifests", response_model=ManifestCreated, status_code=201)
+def create_manifest(payload: ManifestCreate,
+                    conn: sqlite3.Connection = Depends(get_db)):
+    """Register a manifest revision (pre-flight evaluation runs automatically)."""
+    _validate_lineage(conn, payload)
+    report = _evaluate_with_lineage(conn, payload)
+    manifest_id = _new_manifest_id()
+    row = insert_manifest(conn, manifest_id, payload)
+    save_precheck(conn, manifest_id, json.dumps(report.model_dump(mode="json")))
+    row = get_manifest(conn, manifest_id)
+    result = _summary(row)
+    result["report"] = report.model_dump(mode="json")
+    return result
+
+
+@app.get("/manifests", response_model=list[dict])
+def get_manifests(media_id: str = Query(..., min_length=1),
+                  conn: sqlite3.Connection = Depends(get_db)):
+    return [_summary(r) for r in list_manifests(conn, media_id)]
+
+
+@app.get("/manifests/{manifest_id}")
+def read_manifest(manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    return {**_summary(row),
+            "payload": json.loads(row["payload_json"]),
+            "payload_digest": row["payload_digest"]}
+
+
+@app.post("/manifests/{manifest_id}/precheck", response_model=EvaluationReport)
+def precheck_manifest(manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    """Re-run every verification rule without sealing. Works on any revision."""
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    payload = payload_from_row(row)
+    report = _evaluate_with_lineage(conn, payload)
+    save_precheck(conn, manifest_id, json.dumps(report.model_dump(mode="json")))
+    return report
+
+
+@app.post("/manifests/{manifest_id}/seal",
+          response_model=SealResult,
+          responses={409: {"model": SealRejected}})
+def seal_manifest(manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    """Seal a draft revision. Any error finding rejects sealing; the manifest
+    stays a draft and the blocking findings (medium, intervals, events) are
+    returned so the operator can produce a corrected derived revision."""
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    if row["status"] == "sealed":
+        raise HTTPException(409, detail={"code": "ALREADY_SEALED",
+                                         "message": "manifest is already sealed; "
+                                                    "sealed manifests are read-only"})
+    if row["status"] == "superseded":
+        raise HTTPException(409, detail={"code": "SUPERSEDED",
+                                         "message": "manifest was superseded by a "
+                                                    "newer revision and is read-only"})
+    payload = payload_from_row(row)
+    report = _evaluate_with_lineage(conn, payload)
+    if not report.sealable:
+        blockers = [f for f in report.findings if f.severity == Severity.error]
+        raise HTTPException(409, detail={
+            "detail": "manifest is not sealable",
+            "manifest_id": manifest_id,
+            "sealable": False,
+            "blocking_findings": [f.model_dump(mode="json") for f in blockers],
+        })
+
+    sealed_at = datetime.now(timezone.utc).isoformat()
+    report_json = json.dumps(report.model_dump(mode="json"))
+    mark_sealed(conn, manifest_id, sealed_at, report_json,
+                report.merkle_root, report.reconstructed_sha256)
+    row = get_manifest(conn, manifest_id)
+    package = build_evidence_package(row, report)
+    return SealResult(
+        manifest_id=manifest_id,
+        status="sealed",
+        sealed_at=sealed_at,
+        merkle_root=report.merkle_root or "",
+        reconstructed_sha256=report.reconstructed_sha256,
+        evidence_package_digest=package["evidence_package_digest"])
+
+
+@app.get("/manifests/{manifest_id}/findings",
+         response_model=list[Finding])
+def manifest_findings(manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    report = report_from_json(row["seal_report_json"] or row["precheck_json"])
+    return report.findings if report else []
+
+
+@app.get("/manifests/{manifest_id}/evidence-package")
+def evidence_package(manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    """Deterministic, reproducible JSON evidence package (see /evidence/recompute)."""
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    report = report_from_json(row["seal_report_json"] or row["precheck_json"])
+    if report is None:
+        report = _evaluate_with_lineage(conn, payload_from_row(row))
+    return build_evidence_package(row, report)
+
+
+@app.get("/media/{media_id}", response_model=MediaRecord)
+def read_media(media_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    row = get_media(conn, media_id)
+    if row is None:
+        raise HTTPException(404, f"media {media_id} not found")
+    return MediaRecord(
+        media_id=row["media_id"], evidence_label=row["evidence_label"],
+        sector_size=row["sector_size"], total_sectors=row["total_sectors"],
+        capacity_bytes=row["capacity_bytes"], media_sn=row["media_sn"],
+        first_manifest_id=row["first_manifest_id"],
+        first_registered_at=row["first_registered_at"])
+
+
+@app.get("/diffs", response_model=DiffReport)
+def compare_revisions(left: str = Query(..., description="manifest id (base)"),
+                      right: str = Query(..., description="manifest id (revision)"),
+                      conn: sqlite3.Connection = Depends(get_db)):
+    left_row, right_row = get_manifest(conn, left), get_manifest(conn, right)
+    if left_row is None:
+        raise HTTPException(404, f"manifest {left} not found")
+    if right_row is None:
+        raise HTTPException(404, f"manifest {right} not found")
+    if left_row["media_id"] != right_row["media_id"]:
+        raise HTTPException(422, "manifests belong to different media")
+    left_report = (report_from_json(left_row["seal_report_json"]
+                                    or left_row["precheck_json"])
+                   or _evaluate_with_lineage(conn, payload_from_row(left_row)))
+    right_report = (report_from_json(right_row["seal_report_json"]
+                                     or right_row["precheck_json"])
+                    or _evaluate_with_lineage(conn, payload_from_row(right_row)))
+    return diff_manifests(left_row, right_row, left_report, right_report)
+
+
+@app.post("/evidence/recompute")
+def recompute_evidence(body: dict[str, Any]):
+    """Recompute every digest inside an evidence package from its raw fields."""
+    declared_digest = body.get("evidence_package_digest")
+    package_digest_ok = None
+    if declared_digest:
+        package_digest_ok = package_digest(body) == declared_digest
+
+    pkg = body.get("package") or {}
+    submission = body.get("submission") or {}
+    payload_digest_recomputed = digest_canonical(submission)
+    payload_digest_ok = payload_digest_recomputed == pkg.get("payload_digest")
+
+    chunks = submission.get("chunks") or []
+    chunks_by_id = {c["chunk_id"]: c for c in chunks}
+    computed = body.get("computed") or {}
+    media = submission.get("media") or {}
+    geom = media.get("geometry") or {}
+    sector_size = int(geom.get("sector_size") or 0) or 1
+    total_sectors = int(geom.get("total_sectors") or 0)
+
+    # Follow the reconstructed order stored in the package: corrections may have
+    # superseded raw chunks that are still present in the submission.
+    ordered_ids = ((computed.get("ordered_chunk_ids") or [])
+                   if isinstance(computed, dict) else [])
+    ordered = [chunks_by_id[cid] for cid in ordered_ids if cid in chunks_by_id]
+    if not ordered:
+        ordered = sorted(chunks, key=lambda c: (int(c["offset"]), c["chunk_id"]))
+
+    intervals = sorted(
+        ((int(c["offset"]) // sector_size,
+          (int(c["offset"]) + int(c["length"])) // sector_size) for c in ordered))
+    merged: list[list[int]] = []
+    overlap_detected = False
+    for s0, s1 in intervals:
+        if merged and s0 < merged[-1][1]:
+            overlap_detected = True
+            merged[-1][1] = max(merged[-1][1], s1)
+        else:
+            merged.append([s0, s1])
+    coverage_ok = (not overlap_detected and bool(merged)
+                   and merged[0][0] == 0 and merged[-1][1] == total_sectors)
+
+    merkle_recomputed = merkle_root([c["sha256"] for c in ordered])
+    computed = body.get("computed") or {}
+    merkle_ok = merkle_recomputed == computed.get("merkle_root")
+
+    linear = None
+    total_hash_ok = None
+    if all(c.get("content_b64") for c in ordered) and ordered:
+        import base64
+        linear = linear_sha256([base64.b64decode(c["content_b64"])
+                                for c in ordered])
+        expected = submission.get("expected_total_sha256")
+        if expected:
+            total_hash_ok = linear == expected
+
+    checks = {
+        "payload_digest_ok": payload_digest_ok,
+        "merkle_root_ok": merkle_ok,
+        "coverage_ok": coverage_ok,
+        "overlap_detected": overlap_detected,
+        "total_hash_ok": total_hash_ok,
+        "evidence_package_digest_ok": package_digest_ok,
+    }
+    # overlap_detected is an informational negative indicator, not a pass flag.
+    pass_flags = {k: v for k, v in checks.items()
+                  if k != "overlap_detected" and v is not None}
+    valid = all(pass_flags.values())
+    return {
+        "format": pkg.get("format"),
+        "manifest_id": pkg.get("manifest_id"),
+        "valid": valid,
+        "checks": checks,
+        "recomputed": {
+            "payload_digest": payload_digest_recomputed,
+            "merkle_root": merkle_recomputed,
+            "reconstructed_sha256": linear,
+            "covered_intervals": [{"start_sector": a, "end_sector": b}
+                                  for a, b in merged],
+            "evidence_package_digest": package_digest(body),
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
