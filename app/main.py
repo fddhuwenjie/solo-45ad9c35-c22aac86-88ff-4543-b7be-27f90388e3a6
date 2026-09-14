@@ -508,16 +508,25 @@ def inspection_history(manifest_id: str,
     # cumulative coverage: an in-plan, non-duplicate reading that returned
     # bytes -- matching, conflicting, or with an unrecomputable frozen
     # baseline. Planned-but-missing intervals and reported read failures are
-    # not "covered", and duplicate/out-of-plan readings never reach the
-    # per-interval results. Union across inspections de-duplicates repeats.
+    # not "covered"; out-of-plan readings never reach the per-interval
+    # results, and per-run duplicated readings are excluded explicitly below.
+    # Union across inspections de-duplicates repeats.
     read_statuses = {"match", "digest-conflict", "unverifiable"}
     for rep in reports:
         results[rep.result] = results.get(rep.result, 0) + 1
+        # An interval submitted more than once within this run contributes
+        # zero coverage even though its first reading still has a per-interval
+        # result: duplicated readings are not additional evidence.
+        duplicated = {(f.start_sector, f.end_sector)
+                      for f in rep.findings
+                      if f.code == "INSPECTION_READING_DUPLICATE"}
         status_by_interval = {(iv.start_sector, iv.end_sector): iv.status
                               for iv in rep.intervals}
         for iv in rep.planned_intervals:
-            if status_by_interval.get((iv.start_sector, iv.end_sector)) \
-                    in read_statuses:
+            key = (iv.start_sector, iv.end_sector)
+            if key in duplicated:
+                continue
+            if status_by_interval.get(key) in read_statuses:
                 sampled.update(range(iv.start_sector, iv.end_sector))
         for d in rep.divergent_intervals:
             key = (d.replica_id, d.start_sector, d.end_sector)

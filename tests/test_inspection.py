@@ -228,6 +228,61 @@ def test_duplicate_and_out_of_plan_readings_are_inconclusive(client):
     assert any(f["start_sector"] == 40 for f in oob)
 
 
+def test_duplicate_interval_contributes_zero_coverage(client):
+    """Submitting the same in-plan reading twice keeps the duplicate warning
+    and the first reading's comparison, but that interval contributes zero
+    sectors both to the run's covered/verified counts and to the historical
+    cumulative coverage."""
+    mid = sealed_manifest(client, "M-DUPCOV")
+    plan = get_plan(client, mid)
+    intervals = plan["planned_intervals"]
+    head = intervals[0]
+    assert (head["start_sector"], head["end_sector"]) == (0, 1)
+
+    readings = make_readings(intervals)
+    readings.append(dict(readings[0]))  # [0,1) submitted twice
+    rep = submit(client, mid, plan, inspection_id="I-D1",
+                 readings=readings).json()
+
+    assert rep["result"] == "inconclusive"
+    dup = [f for f in rep["findings"]
+           if f["code"] == "INSPECTION_READING_DUPLICATE"]
+    assert len(dup) == 1
+    assert (dup[0]["start_sector"], dup[0]["end_sector"]) == (0, 1)
+    # the first reading was still compared and matched; only the duplicate
+    # reading itself is rejected
+    head_result = next(iv for iv in rep["intervals"]
+                       if iv["start_sector"] == 0 and iv["end_sector"] == 1)
+    assert head_result["status"] == "match"
+
+    # the duplicated interval's one sector contributes nothing
+    assert rep["planned_sectors"] == 8
+    assert rep["covered_sectors"] == 7
+    assert rep["verified_sectors"] == 7
+    assert rep["coverage_rate"] == 0.875
+    assert rep["verified_rate"] == 0.875
+
+    history = client.get(f"/manifests/{mid}/inspection-report").json()
+    assert history["inspection_count"] == 1
+    # 7 genuinely-read sectors of 64 total -- not 8
+    assert history["cumulative_coverage_rate"] == 7 / TOTAL_SECTORS
+
+    # a later, non-duplicated run over the same plan restores the duplicated
+    # sector's coverage; append-only keeps the first record untouched
+    rep2 = submit(client, mid, plan, inspection_id="I-D2",
+                  readings=make_readings(intervals,
+                                         read_at=T_READ + timedelta(days=1)),
+                  device_id="READER-02").json()
+    assert rep2["result"] == "passed"
+    assert rep2["covered_sectors"] == 8
+    history2 = client.get(f"/manifests/{mid}/inspection-report").json()
+    assert history2["cumulative_coverage_rate"] == 8 / TOTAL_SECTORS
+    assert history2["results"] == {"inconclusive": 1, "passed": 1}
+    stored1 = client.get(f"/manifests/{mid}/inspections/I-D1").json()
+    assert stored1 == rep
+    assert stored1["covered_sectors"] == 7
+
+
 def test_read_failure_is_inconclusive_not_overwritten_by_retest(client):
     mid = sealed_manifest(client, "M-READERR")
     plan = get_plan(client, mid)
@@ -581,6 +636,9 @@ def test_history_coverage_excludes_missing_failed_duplicate_oob(client):
                        for s in range(iv["start_sector"], iv["end_sector"])}
     sampled_sectors -= set(range(skip_iv["start_sector"], skip_iv["end_sector"]))
     sampled_sectors -= set(range(err_iv["start_sector"], err_iv["end_sector"]))
+    # the duplicated interval contributes zero coverage in this run, even
+    # though its first reading carried a correct digest
+    sampled_sectors -= set(range(dup_iv["start_sector"], dup_iv["end_sector"]))
 
     free = next(s for s in range(TOTAL_SECTORS - 1)
                 if s not in planned_sectors_set and s + 1 not in planned_sectors_set)
@@ -604,19 +662,26 @@ def test_history_coverage_excludes_missing_failed_duplicate_oob(client):
     assert rep1["planned_sectors"] == len(planned_sectors_set)
     assert rep1["covered_sectors"] == expected_covered
     assert rep1["verified_sectors"] == expected_covered
+    dup_result = next(iv for iv in rep1["intervals"]
+                      if iv["start_sector"] == dup_iv["start_sector"])
+    assert dup_result["status"] == "match"  # first reading still compared
+    width = lambda iv: iv["end_sector"] - iv["start_sector"]
+    assert rep1["covered_sectors"] == \
+        len(planned_sectors_set) - width(skip_iv) - width(err_iv) - width(dup_iv)
 
     history = client.get(f"/manifests/{mid}/inspection-report").json()
-    # missing/read-failed intervals are not covered; duplicate/oob readings
+    # missing/read-failed/duplicated intervals are not covered; oob readings
     # contribute nothing
     assert history["cumulative_coverage_rate"] == \
         expected_covered / TOTAL_SECTORS
     assert history["cumulative_coverage_rate"] < \
         len(planned_sectors_set) / TOTAL_SECTORS
 
-    # I-2: now genuinely read the two intervals I-1 did not, plus an
-    # out-of-plan reading that must still be ignored; other plan intervals
-    # stay missing in this run (they were already covered by I-1).
-    fill = make_readings([skip_iv, err_iv],
+    # I-2: now genuinely read the three intervals I-1 did not count
+    # (skipped, read-failed and duplicated), plus an out-of-plan reading that
+    # must still be ignored; the other plan intervals stay missing in this run
+    # (they were already covered by I-1).
+    fill = make_readings([dup_iv, skip_iv, err_iv],
                          read_at=T_READ + timedelta(days=1))
     fill.append({"start_sector": free, "end_sector": free + 1,
                  "read_at": (T_READ + timedelta(days=1)).isoformat(),
@@ -625,6 +690,7 @@ def test_history_coverage_excludes_missing_failed_duplicate_oob(client):
                   ratio=0.25, readings=fill).json()
     assert rep2["result"] == "inconclusive"  # remaining intervals missing + oob
     assert rep2["covered_sectors"] == \
+        (dup_iv["end_sector"] - dup_iv["start_sector"]) + \
         (skip_iv["end_sector"] - skip_iv["start_sector"]) + \
         (err_iv["end_sector"] - err_iv["start_sector"])
 

@@ -274,6 +274,11 @@ def evaluate_inspection(payload: InspectionCreate,
 
     # ------------------------------------------- submitted readings shape ---
     by_interval: dict[tuple[int, int], Any] = {}
+    # Planned intervals submitted more than once in THIS inspection. The first
+    # reading is still compared below (so a real digest conflict is not
+    # hidden), but the whole interval contributes zero sectors to this run's
+    # coverage -- a duplicated reading is not additional evidence.
+    duplicate_keys: set[tuple[int, int]] = set()
     shape_violations = False
     for rd in payload.readings:
         key = (rd.start_sector, rd.end_sector)
@@ -300,6 +305,7 @@ def evaluate_inspection(payload: InspectionCreate,
                   replica_ids=[payload.replica_id],
                   start_sector=rd.start_sector, end_sector=rd.end_sector)
             shape_violations = True
+            duplicate_keys.add(key)
             continue
         by_interval[key] = rd
 
@@ -350,8 +356,12 @@ def evaluate_inspection(payload: InspectionCreate,
                 error=rd.error, chunk_ids=chunk_ids))
             continue
         # The replica genuinely returned bytes for this in-plan interval, so
-        # it counts as covered even if the frozen baseline is unavailable.
-        covered_sectors += s1 - s0
+        # it counts as covered even if the frozen baseline is unavailable --
+        # unless the same interval was submitted more than once in this run,
+        # in which case none of its sectors count as coverage.
+        counted = (s0, s1) not in duplicate_keys
+        if counted:
+            covered_sectors += s1 - s0
         expected = expected_interval_digest(sealed_payload, ranges,
                                             sector_size, s0, s1, resolver,
                                             baseline_cache)
@@ -395,7 +405,8 @@ def evaluate_inspection(payload: InspectionCreate,
                 expected_sha256=expected, actual_sha256=rd.sha256,
                 read_at=rd.read_at, chunk_ids=chunk_ids))
             continue
-        verified_sectors += s1 - s0
+        if counted:
+            verified_sectors += s1 - s0
         intervals.append(InspectionIntervalResult(
             start_sector=s0, end_sector=s1, status="match",
             expected_sha256=expected, actual_sha256=rd.sha256,
