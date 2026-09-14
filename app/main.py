@@ -272,17 +272,26 @@ def seal_manifest(manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
 
     sealed_at = datetime.now(timezone.utc).isoformat()
     report_json = json.dumps(report.model_dump(mode="json"))
+
+    # Build the complete evidence package BEFORE changing any state: package
+    # serialization/assembly can fail, and a failed seal attempt must never
+    # leave the revision marked sealed. The package records status/sealed_at
+    # of the successful sealing it is part of.
+    package = build_evidence_package(
+        row, report,
+        status_override="sealed", sealed_at_override=sealed_at)
+
+    # Everything above succeeded -- only now commit the sealed state.
     mark_sealed(conn, manifest_id, sealed_at, report_json,
                 report.merkle_root, report.reconstructed_sha256)
-    row = get_manifest(conn, manifest_id)
-    package = build_evidence_package(row, report)
     return SealResult(
         manifest_id=manifest_id,
         status="sealed",
         sealed_at=sealed_at,
         merkle_root=report.merkle_root or "",
         reconstructed_sha256=report.reconstructed_sha256,
-        evidence_package_digest=package["evidence_package_digest"])
+        evidence_package_digest=package["evidence_package_digest"],
+        evidence_package=package)
 
 
 @app.get("/manifests/{manifest_id}/findings",
@@ -485,6 +494,9 @@ def recompute_evidence(body: dict[str, Any]):
     recorded_recovery = computed.get("recovery") if isinstance(
         computed.get("recovery"), dict) else None
     if payload is not None:
+        def _norm(d):
+            return json.loads(canonical_json(d)) if d is not None else None
+
         eff_for_recovery: list[Any] = []
         if ordered_ids:
             by_id_rc = {c.chunk_id: c for c in payload.chunks}
@@ -508,46 +520,37 @@ def recompute_evidence(body: dict[str, Any]):
             content_rows=content_rows_map, emit=_recovery_collect)
         recomputed_recovery = recovery_state.model_dump(mode="json")
 
-        def _norm(d):
-            return json.loads(canonical_json(d)) if d is not None else None
-
-        rec_core = {
-            "provenance_mode": recomputed_recovery["provenance_mode"],
-            "segments": recomputed_recovery["segments"],
-            "exceptions": recomputed_recovery["exceptions"],
-            "freeze_policy": recomputed_recovery["freeze_policy"],
-            "freeze_ok": recomputed_recovery["freeze_ok"],
-            "read_sectors": recomputed_recovery["read_sectors"],
-            "filled_sectors": recomputed_recovery["filled_sectors"],
-            "unrecovered_sectors": recomputed_recovery["unrecovered_sectors"],
-            "accepted_sectors": recomputed_recovery["accepted_sectors"],
-            "recovered_sectors": recomputed_recovery["recovered_sectors"],
-            "recovery_rate": recomputed_recovery["recovery_rate"],
-            "fill_rate": recomputed_recovery["fill_rate"],
-            "unrecovered_rate": recomputed_recovery["unrecovered_rate"],
-            "attempts": recomputed_recovery["attempts"],
-        }
         error_codes = {f["code"] for f in recovery_findings
                        if f["severity"] == "error"}
-        segments_content_ok = all(
-            s.content_ok or (s.kind == "unrecovered"
-                             and s.exception_id is not None)
-            for s in recovery_state.segments)
+
+        def _segment_ok(s) -> bool:
+            if s.kind == "unrecovered":
+                return s.exception_id is not None
+            return s.kind in ("read", "fill") and s.content_ok
+
+        recomputation_clean = (not error_codes
+                               and recovery_state.freeze_ok
+                               and all(_segment_ok(s)
+                                       for s in recovery_state.segments))
         recovery_detail = {
+            "provenance_mode": recovery_state.provenance_mode,
             "recovery_rate": recovery_state.recovery_rate,
             "fill_rate": recovery_state.fill_rate,
             "read_sectors": recovery_state.read_sectors,
             "filled_sectors": recovery_state.filled_sectors,
+            "unattested_sectors": recovery_state.unattested_sectors,
             "unrecovered_sectors": recovery_state.unrecovered_sectors,
             "accepted_sectors": recovery_state.accepted_sectors,
+            "recovered_sectors": recovery_state.recovered_sectors,
             "freeze_ok": recovery_state.freeze_ok,
             "error_codes": sorted(error_codes),
         }
-        recomputation_clean = (not error_codes and segments_content_ok
-                               and recovery_state.freeze_ok)
+        # Precheck, diffs, evidence package and recompute use the exact same
+        # attempt records, exception decisions and recovery rate: the stored
+        # recovery block must equal the recomputed state field-for-field.
         if recorded_recovery is not None:
-            recorded_core = {k: recorded_recovery.get(k) for k in rec_core}
-            recovery_ok = (_norm(recorded_core) == _norm(rec_core)
+            recovery_ok = (_norm(recorded_recovery)
+                           == _norm(recomputed_recovery)
                            and recomputation_clean)
         else:
             # package produced before attempts existed: clean legacy analysis

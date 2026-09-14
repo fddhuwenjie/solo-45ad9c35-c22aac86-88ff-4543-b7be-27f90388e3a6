@@ -38,13 +38,19 @@ def _sorted_findings(report: EvaluationReport) -> list[dict[str, Any]]:
 
 
 def build_evidence_package(row: sqlite3.Row,
-                           report: EvaluationReport) -> dict[str, Any]:
+                           report: EvaluationReport,
+                           *,
+                           status_override: Optional[str] = None,
+                           sealed_at_override: Optional[str] = None
+                           ) -> dict[str, Any]:
     """Assemble a deterministic, self-describing evidence package.
 
     Everything needed to recompute the roots (canonical submission, Merkle
     recipe and coverage map) is included. ``evidence_package_digest`` covers
     the package with that field removed, so re-fetching and recomputing yields
-    the same digest.
+    the same digest. ``status_override``/``sealed_at_override`` let the sealing
+    endpoint construct the package before the sealed state is committed, so a
+    package-building failure never leaves the manifest half-sealed.
     """
     payload = payload_from_row(row)
     payload_obj = payload.model_dump(mode="json")
@@ -55,12 +61,13 @@ def build_evidence_package(row: sqlite3.Row,
             "manifest_id": row["manifest_id"],
             "media_id": row["media_id"],
             "revision": row["revision"],
-            "status": row["status"],
+            "status": status_override or row["status"],
             "change_kind": row["change_kind"],
             "parent_manifest_id": row["parent_manifest_id"],
             "superseded_by": row["superseded_by"],
             "created_at": row["created_at"],
-            "sealed_at": row["sealed_at"],
+            "sealed_at": (sealed_at_override if sealed_at_override is not None
+                          else row["sealed_at"]),
             "payload_digest": row["payload_digest"],
         },
         "submission": payload_obj,
@@ -85,22 +92,7 @@ def build_evidence_package(row: sqlite3.Row,
                 "gaps": [i.model_dump() for i in report.gaps],
                 "overlaps": [o.model_dump() for o in report.overlaps],
             },
-            "recovery": {
-                "provenance_mode": report.recovery.provenance_mode,
-                "attempts": [a.model_dump() for a in report.recovery.attempts],
-                "segments": [s.model_dump() for s in report.recovery.segments],
-                "exceptions": report.recovery.exceptions,
-                "freeze_policy": report.recovery.freeze_policy,
-                "freeze_ok": report.recovery.freeze_ok,
-                "read_sectors": report.recovery.read_sectors,
-                "filled_sectors": report.recovery.filled_sectors,
-                "unrecovered_sectors": report.recovery.unrecovered_sectors,
-                "accepted_sectors": report.recovery.accepted_sectors,
-                "recovered_sectors": report.recovery.recovered_sectors,
-                "recovery_rate": report.recovery.recovery_rate,
-                "fill_rate": report.recovery.fill_rate,
-                "unrecovered_rate": report.recovery.unrecovered_rate,
-            },
+            "recovery": report.recovery.model_dump(mode="json"),
         },
         "findings": _sorted_findings(report),
         "sealable": report.sealable,

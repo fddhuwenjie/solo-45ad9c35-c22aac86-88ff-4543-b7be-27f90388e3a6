@@ -11,6 +11,13 @@
 - **源介质标识与几何参数**：`media_id`、序列号/型号、扇区大小、扇区数、容量；
 - **写保护器（写阻断器）校验**：只读模式、是否通过、自检固件摘要与期望值；
 - **采集会话**：操作人员、工具、起止时间、中断原因（断电/换盘/纠错）；
+- **采集会话**：操作人员、工具、起止时间、中断原因（断电/换盘/纠错）；
+  会话按采集顺序提交**读取尝试** `read_attempts`：源扇区区间、重试轮次、
+  结果（成功读取/错误/填充）、工具错误码、实际读取长度、零填充/模式填充/
+  稀疏洞声明，并绑定最终分块；
+- **人工例外** `recovery_exceptions`：人工接受的仍未恢复扇区区间（必须说明
+  理由，只能在派生修订中登记），以及封存时冻结的未恢复容忍策略
+  `freeze_policy`（绝对扇区数和/或比例，缺省为零容忍）；
 - **分块文件**：块 ID、所属会话、**字节偏移**、长度、SHA-256、可选 Base64 内联内容、纠错关系；
 - **存储副本**：采集件 `acquired`、复制件 `copy`、封存件 `archive` 及其父子链；
 - **交接事件**：采集 / 复制 / 校验 / 封存 / 移交，每个事件的 `digest_before/after`。
@@ -41,6 +48,34 @@
 | `CUSTODY_CHAIN_EMPTY / CUSTODY_NO_EVENTS / CUSTODY_EVENT_MISSING / CUSTODY_TERMINAL_NOT_HANDED_OVER / REPLICA_CHAIN_UNPROVEN`（硬门槛） | 零交接事件、某副本无事件、缺 acquired/copied 必需事件、末端副本未同时 sealed+transferred、无法证明采集→复制→封存移交的连续性 |
 | `ACQUIRED_DIGEST_MISMATCH / REPLICA_MERKLE_MISMATCH` | 采集件摘要/Merkle 与按真实字节重建的结果不一致 |
 | `CUSTODY_DIGEST_BREAK / _AFTER_BREAK / _EXPECTED_MISMATCH` | 交接前后摘要断链、封存/移交摘要与副本不一致（篡改或重封失败） |
+| `RECOVERY_ATTESTATION_REQUIRED` | **硬门槛**：非空介质没有任何读取尝试记录；分块摘要匹配只证明字节哈希正确，不能证明字节来自源介质——工具在坏扇区后写的零填充/稀疏洞会与成功读取无法区分 |
+| `ATTEMPT_OUT_OF_RANGE / _SESSION_UNKNOWN / _CHUNK_UNKNOWN / _CHUNK_RANGE_MISMATCH / _DUPLICATE` | 尝试越界、引用未知会话/分块、区间不落在所绑定分块内、尝试 ID 重复 |
+| `ATTEMPT_ROUND_ORDER_REVERSED` | 同一会话内轮次在提交顺序中倒退（必须非递减） |
+| `ATTEMPT_PARTIAL_NOT_SPLIT / _ACTUAL_LENGTH_MISMATCH` | 部分读取没有按实际读取扇区拆段（声称区间宽于 `actual_read_length`），或错误/填充尝试上报了非零读取长度 |
+| `ATTEMPT_CONTENT_DIGEST_MISMATCH / _CONTENT_UNVERIFIABLE / _SUCCESS_CONFLICT / _PROVENANCE_MISSING` | 成功读取的摘要不能从所绑定分块字节复算、区间无内容可核验、同区间多次成功读取的工具摘要冲突、分块扇区完全没有尝试记录 |
+| `FILL_CONTENT_MISMATCH / FILL_HOLE_UNVERIFIABLE` | 声明的零/模式填充与分块实际字节不符、声明稀疏洞但字节存在、或稀疏洞检测对该内容源不可用 |
+| `UNRECOVERED_OVER_FREEZE_POLICY` | 无人工例外接受的未恢复扇区超过冻结策略；返回区间、会话和分块并拒绝封存。**显式声明的填充带有溯源，不占未恢复预算；人工接受的扇区只豁免冻结策略，永不计为已恢复** |
+| `RECOVERY_EXCEPTION_ON_INITIAL / _NOT_UNRECOVERED / _DUPLICATE / _OUT_OF_RANGE` | 例外登记在初始修订、接受了已成功读取/已填充的区间（只能接受仍未恢复区）、例外区间重叠或越界。例外必须在派生修订中说明理由 |
+
+### 坏扇区重试与填充溯源
+
+采集会话**按顺序提交读取尝试**。后端把相互交叠的尝试区间切分成原子扇区
+切片，再按"最高重试轮次、同轮按提交顺序"合并多轮结果：后续成功读取可以
+取代早期失败（反之亦然），但**失败记录始终保留**。每个最终扇区段都标明：
+
+- `read`：字节确实来自源介质，并从所绑定分块的真实字节复算工具摘要；
+- `fill`：声明的零填充 / 模式填充（字节必须与声明一致）或**真实文件系统
+  稀疏洞**（通过 `SEEK_DATA`/`SEEK_HOLE` 判定，平台/文件系统不支持时判为
+  不可核验而非默认通过）；
+- `unrecovered`：从未读到；只有被带理由的人工例外表接受才能封存，
+  且只豁免冻结策略，**不**计入 `recovered_sectors`；
+- `unattested`：完全没有读取尝试溯源——摘要匹配不能代替源读取证明。
+
+`recovery_rate = read_sectors / total_sectors` 是**实际源读取率**；
+`fill_rate`、`unrecovered_rate`、`accepted_sectors` 分别报告填充、未接受
+未恢复和人工接受扇区。预检、`GET /recovery`、版本差异、证据包与
+`/evidence/recompute` 使用同一版尝试记录、例外决定和恢复率：证据包内嵌
+整版恢复状态，复算时逐字段重算比对，篡改任何一段都会使包失效。
 
 所有 finding 都携带 `media_id`，并尽量带 `chunk_ids / session_id / replica_ids /
 event_id` 与扇区区间，便于直接定位介质、区间和事件。
@@ -84,8 +119,9 @@ event_id` 与扇区区间，便于直接定位介质、区间和事件。
 | `GET  /manifests?media_id=` | 列出某介质全部修订 |
 | `GET  /manifests/{id}` | 读取清单（含规范化提交原文与 `payload_digest`） |
 | `POST /manifests/{id}/precheck` | 只核验不封存，任何状态可重跑 |
-| `POST /manifests/{id}/seal` | 封存；失败 409 返回阻断性 finding |
+| `POST /manifests/{id}/seal` | 封存；成功 200 直接返回完整证据包 `evidence_package`；失败 409 返回阻断性 finding，且**不改变封存状态**（证据包在状态落库前构造，任何序列化失败都不会留下"半封存"） |
 | `GET  /manifests/{id}/findings` | 最近一次核验/封存的全部 finding |
+| `GET  /manifests/{id}/recovery` | 读取尝试日志、最终 read/fill/unrecovered 分段、例外决定与实际源读取率 |
 | `GET  /manifests/{id}/evidence-package` | **可复算 JSON 证据包**（确定性序列化） |
 | `POST /evidence/recompute` | 仅凭证据包原始字段复算全部摘要并逐项给 true/false |
 | `GET  /diffs?left=&right=` | 两个修订版本比较（参数变化、增删块/会话/副本/事件、根差异） |
@@ -138,8 +174,9 @@ EVIDENCE_ROOTS=/var/evidence:/mnt/raid/acquisitions \
 测试：
 
 ```bash
-pytest -q          # 51 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
-                   # 文件型分块读取/缺件/截断/错序拼接、零副本零事件、证据包复算等
+pytest -q          # 61 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
+                   # 文件型分块读取/缺件/截断/错序拼接、零副本零事件、证据包复算、
+                   # 坏扇区重试合并/填充溯源/稀疏洞/人工例外/冻结策略/封存原子性等
 ```
 
 ### 请求示例（片段）
@@ -176,9 +213,11 @@ app/
   hashing.py    规范 JSON、SHA-256、线性摘要、Merkle 树
   content.py    分块内容解析：内联 Base64 或证据根内 stored_path 流式读取
   chains.py     副本/交接链最低完整性（引擎与证据包复算共用的纯函数）
+  recovery.py   读取尝试拆段合并、重试取代、填充/稀疏洞溯源、例外与冻结策略
   verifier.py   核验引擎（全部规则，可独立单测）
   evidence.py   证据包构造、修订比较
   db.py         SQLite 建表、事务化修订写入、封存/预检持久化
   main.py       FastAPI 路由
-tests/          51 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块）
+tests/          61 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块、
+                  坏扇区重试/填充溯源/稀疏洞/人工例外/封存原子性）
 ```

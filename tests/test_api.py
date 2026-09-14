@@ -165,7 +165,13 @@ def test_chunk_correction_replaces_bad_segment_in_new_revision(client):
                       "correction_of": "C02",
                       "note": "re-imaged after read error on sector 16"})
     p2["chunks"].append(corrected)
-
+    # the re-imaged range is genuinely read again in the correction round
+    p2.setdefault("read_attempts", []).append({
+        "attempt_id": "A-C02X", "session_id": corrected["session_id"],
+        "chunk_id": "C02X",
+        "start_sector": 16, "end_sector": 32, "round": 2, "result": "read",
+        "actual_read_length": 16 * SECTOR_SIZE,
+        "sha256": hashlib.sha256(data).hexdigest()})
     new_image = b"".join(data if i == 1 else chunk_bytes(i)
                          for i in range(N_CHUNKS))
     expected = hashlib.sha256(new_image).hexdigest()

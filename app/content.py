@@ -300,13 +300,15 @@ class FilesystemContentResolver:
                                         source="file", stored_path=str(path),
                                         registered_path=registered)
             try:
-                # Next data offset at/after byte_start; a hole reaches at least
-                # byte_end when that offset is >= byte_end.
-                next_data = os.lseek(fd, byte_start, os.SEEK_DATA)
+                # SEEK_DATA at a data/hole boundary can return the boundary
+                # itself; probe the midpoint of the requested range. The range
+                # is a hole when no data extent starts before its end.
+                midpoint = byte_start + (byte_end - byte_start) // 2
+                next_data = os.lseek(fd, midpoint, os.SEEK_DATA)
                 is_hole = next_data >= byte_end
             except OSError as exc:
                 if exc.errno == errno.ENXIO:
-                    # no data from byte_start to EOF -> the tail is one hole
+                    # no data from midpoint to EOF: tail region is one hole
                     is_hole = True
                 else:
                     return HoleStatusResult(

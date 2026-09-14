@@ -311,11 +311,13 @@ class FinalSegment(ForensicModel):
     end_sector: int  # exclusive
     chunk_id: str
     session_id: Optional[str] = None
-    # read           -> bytes really read from the source
-    # fill           -> declared zero/pattern padding or sparse hole
-    # unrecovered    -> never read; sealable only when covered by an accepted
-    #                   exception (exception_id then set)
-    kind: Literal["read", "fill", "unrecovered"]
+    # read        -> bytes really read from the source
+    # fill        -> declared zero/pattern padding or sparse hole
+    # unrecovered -> never read; sealable only when covered by an accepted
+    #                exception (exception_id then set)
+    # unattested  -> no read-attempt record at all; a matching digest can
+    #                never substitute for proof of a source-medium read
+    kind: Literal["read", "fill", "unrecovered", "unattested"]
     winning_attempt_id: Optional[str] = None
     exception_id: Optional[str] = None
     fill_method: Optional[str] = None
@@ -334,10 +336,13 @@ class RecoveryState(ForensicModel):
     total_sectors: int = 0
     read_sectors: int = 0
     filled_sectors: int = 0
+    unattested_sectors: int = 0
     unrecovered_sectors: int = 0
     accepted_sectors: int = 0
-    recovered_sectors: int = 0           # real reads + accepted exceptions
-    recovery_rate: float = 0.0           # (read + accepted) / total
+    # Actual source-read recovery: accepted exceptions document that sectors
+    # are NOT source data; they never count as recovered.
+    recovered_sectors: int = 0
+    recovery_rate: float = 0.0           # read_sectors / total (source reads only)
     fill_rate: float = 0.0               # filled / total
     unrecovered_rate: float = 0.0        # unaccepted unrecovered / total
     freeze_policy: Optional[dict[str, Any]] = None
@@ -407,6 +412,10 @@ class SealResult(ForensicModel):
     merkle_root: str
     reconstructed_sha256: Optional[str] = None
     evidence_package_digest: str
+    evidence_package: Optional[dict[str, Any]] = Field(
+        None,
+        description="Complete reproducible evidence package; returned only "
+                    "when sealing succeeds")
 
 
 class SealRejected(ForensicModel):

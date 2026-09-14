@@ -184,6 +184,7 @@ def build_payload(*, media_id: str = "MEDIA-001",
                   parent: Optional[str] = None,
                   expected_total: bool = True,
                   with_stored_path: bool = False,
+                  with_attempts: bool = True,
                   id_prefix: str = "C") -> dict[str, Any]:
     """Assemble a full manifest submission. Returns a JSON-ready dict."""
     digest = replica_digest or total_sha(chunk_seq)
@@ -241,6 +242,8 @@ def build_payload(*, media_id: str = "MEDIA-001",
     }
     if expected_total:
         payload["expected_total_sha256"] = total_sha(chunk_seq)
+    if with_attempts:
+        attach_read_attempts(payload)
     return payload
 
 
@@ -309,6 +312,46 @@ def write_chunk_files(payload, root, *, chunk_seq=None, omit=(), corrupt=(),
 
 def post_manifest(client, payload):
     return client.post("/manifests", json=payload)
+
+
+def attach_read_attempts(payload, *, rounds=None, overrides=None):
+    """Attach one successful read_attempt per final chunk.
+
+    New provenance rules require the submission to show that the bytes were
+    read from the source medium; a matching digest is not enough. Synthetic
+    tests use this helper to supply ordinary round-1 reads. ``overrides`` maps
+    a chunk_id to a partial attempt dict (used to simulate errors/retries/
+    fills). ``rounds`` maps session_id -> current round (non-decreasing).
+    """
+    attempts = payload.get("read_attempts")
+    if attempts is None:
+        attempts = []
+        payload["read_attempts"] = attempts
+    existing = {a["chunk_id"] for a in attempts}
+    rounds = rounds or {}
+    geom = payload["media"]["geometry"]
+    sector_size = geom["sector_size"]
+    for c in payload["chunks"]:
+        if c["chunk_id"] in existing:
+            continue
+        s0 = c["offset"] // sector_size
+        s1 = s0 + c["length"] // sector_size
+        sid = c["session_id"]
+        rnd = rounds.get(sid, 1)
+        attempt = {
+            "attempt_id": f"A-{c['chunk_id']}",
+            "session_id": sid,
+            "chunk_id": c["chunk_id"],
+            "start_sector": s0,
+            "end_sector": s1,
+            "round": rnd,
+            "result": "read",
+            "actual_read_length": (s1 - s0) * sector_size,
+        }
+        if overrides and c["chunk_id"] in overrides:
+            attempt.update(overrides[c["chunk_id"]])
+        attempts.append(attempt)
+    return payload
 
 
 def seal(client, manifest_id):

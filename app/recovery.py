@@ -263,20 +263,29 @@ def analyze_recovery(
             payload, effective_chunks, valid_attempts, chunk_ranges,
             sector_size, resolver, order_index, out)
     else:
-        # Legacy manifests: the only evidence that bytes came from the source
-        # is the hard chunk-content verification. No fill provenance exists.
+        # Legacy manifests without a read-attempt log: a matching chunk digest
+        # only proves the bytes hash correctly, never that they were read from
+        # the source medium rather than zero-filled / sparse-holed after a
+        # bad-sector error. Every covered sector stays unattested and sealing
+        # is refused for any non-empty source medium.
         for c in effective_chunks:
             cid = _get(c, "chunk_id")
             s0, s1 = chunk_ranges[cid]
             sid = _get(c, "session_id")
-            row = (content_rows or {}).get(cid)
-            verified = bool(row is not None and _get(row, "digest_verified"))
             segments.append(FinalSegment(
                 start_sector=s0, end_sector=s1, chunk_id=cid,
                 session_id=sid if sid in session_ids else None,
-                kind="read" if verified else "unrecovered",
-                content_ok=verified,
-                sha256=_get(row, "sha256") if row else None))
+                kind="unattested", content_ok=False))
+
+        if total_sectors > 0 and effective_chunks:
+            out("error", "RECOVERY_ATTESTATION_REQUIRED",
+                f"manifest registers {total_sectors} source sectors but "
+                f"submits no read attempts; digest matches cannot substitute "
+                f"for proof that the bytes were read from the source medium "
+                f"(zero fills and sparse holes after bad-sector errors are "
+                f"otherwise indistinguishable from successful reads)",
+                chunk_ids=sorted(_get(c, "chunk_id") for c in effective_chunks),
+                start_sector=0, end_sector=total_sectors)
 
         # exceptions cannot accept anything without an attempt log
         for ex in exceptions_all:
@@ -310,12 +319,14 @@ def analyze_recovery(
                 s.exception_id = _get(ex, "exception_id")
 
     # ---------------------------------------------------------------- counts --
-    read_sectors = sum(s.end_sector - s.start_sector for s in segments
-                       if s.kind == "read")
-    filled_sectors = sum(s.end_sector - s.start_sector for s in segments
-                         if s.kind == "fill")
-    unrecovered_all = sum(s.end_sector - s.start_sector for s in segments
-                          if s.kind == "unrecovered")
+    def _span(kind: str) -> int:
+        return sum(s.end_sector - s.start_sector for s in segments
+                   if s.kind == kind)
+
+    read_sectors = _span("read")
+    filled_sectors = _span("fill")
+    unattested_sectors = _span("unattested")
+    unrecovered_all = _span("unrecovered")
     # sectors covered by no chunk at all are likewise unrecovered
     covered = sum(b - a for a, b in chunk_ranges.values())
     uncovered = max(0, total_sectors - covered)
@@ -323,41 +334,36 @@ def analyze_recovery(
     accepted_sectors = sum(s.end_sector - s.start_sector for s in segments
                            if s.kind == "unrecovered" and s.exception_id)
     unaccepted_unrecovered = unrecovered_all - accepted_sectors
-    recovered_sectors = read_sectors + accepted_sectors
-    # Freeze policy counts every sector whose bytes did not come from the
-    # source and that no documented exception accepts: declared fills carry
-    # provenance but are still not source data, so a zero-tolerance policy
-    # rejects them together with still-unrecovered ranges.
-    fill_segments_without_exception = [s for s in segments
-                                       if s.kind == "fill"
-                                       and not s.exception_id]
-    unaccepted_filled = sum(s.end_sector - s.start_sector
-                            for s in fill_segments_without_exception)
-    unaccepted_non_source = unaccepted_unrecovered + unaccepted_filled
+    # Actual source-read recovery. Documented exception acceptances prove the
+    # opposite of recovery -- the sectors stay non-source -- so they never
+    # count as recovered; they only exempt the range from the freeze policy.
+    recovered_sectors = read_sectors
 
     def _ratio(n: int) -> float:
         return round(n / total_sectors, 9) if total_sectors > 0 else 0.0
 
     # --------------------------------------------------------- freeze policy --
+    # The frozen policy bounds only sectors still unrecovered that no
+    # documented exception accepts. Declared fills carry explicit provenance
+    # (the evidence package labels them as non-source) and are NOT charged
+    # against this budget.
     freeze_ok = True
     max_n = policy["max_unrecovered_sectors"]
     max_r = policy["max_unrecovered_ratio"]
-    over_n = max_n is not None and unaccepted_non_source > int(max_n)
-    over_r = max_r is not None and _ratio(unaccepted_non_source) > float(max_r)
+    over_n = max_n is not None and unaccepted_unrecovered > int(max_n)
+    over_r = max_r is not None and _ratio(unaccepted_unrecovered) > float(max_r)
     if over_n or over_r:
         freeze_ok = False
         offending = [s for s in segments
-                     if s.kind in ("unrecovered", "fill")
-                     and not s.exception_id]
+                     if s.kind == "unrecovered" and not s.exception_id]
         intervals = sorted((s.start_sector, s.end_sector) for s in offending)
         chunk_ids = sorted({s.chunk_id for s in offending})
         session_ids_hit = sorted({s.session_id for s in offending
                                   if s.session_id})
         out("error", "UNRECOVERED_OVER_FREEZE_POLICY",
-            f"{unaccepted_non_source} sector(s) were not read from the source "
-            f"({unaccepted_filled} declared fill, {unaccepted_unrecovered} "
-            f"unrecovered) without a documented accepted exception, exceeding "
-            f"the frozen policy {policy}",
+            f"{unaccepted_unrecovered} unrecovered sector(s) remain without "
+            f"a documented accepted exception, exceeding the frozen policy "
+            f"{policy}",
             start_sector=intervals[0][0] if intervals else None,
             end_sector=intervals[0][1] if intervals else None,
             chunk_ids=chunk_ids, session_id=(session_ids_hit[0]
@@ -365,8 +371,8 @@ def analyze_recovery(
                                             else None),
             detail={"unrecovered_sectors": unrecovered_all,
                     "filled_sectors": filled_sectors,
-                    "unaccepted_unrecovered_sectors": unaccepted_unrecovered,
-                    "unaccepted_filled_sectors": unaccepted_filled,
+                    "unaccepted_unrecovered_sectors":
+                        unaccepted_unrecovered,
                     "accepted_sectors": accepted_sectors,
                     "policy": policy,
                     "intervals": [{"start_sector": a, "end_sector": b}
@@ -382,6 +388,7 @@ def analyze_recovery(
         total_sectors=total_sectors,
         read_sectors=read_sectors,
         filled_sectors=filled_sectors,
+        unattested_sectors=unattested_sectors,
         unrecovered_sectors=unrecovered_all,
         accepted_sectors=accepted_sectors,
         recovered_sectors=recovered_sectors,
@@ -420,7 +427,10 @@ def _exception_offending_ranges(ex, segments, total_sectors):
             continue
         why = {"read": "already successfully read from the source",
                "fill": "already declared as zero/pattern padding or a "
-                       "sparse hole"}.get(s.kind, "already accepted")
+                       "sparse hole",
+               "unattested": "not covered by any read-attempt record; submit "
+                             "attempts before it can be accepted"}.get(
+            s.kind, "already accepted")
         offending.append((lo, hi, why))
         cursor = max(cursor, hi)
     if cursor < a1:
@@ -494,91 +504,101 @@ def _resolve_slice(sl: _Slice, sector_size: int, resolver,
     cid = _get(chunk, "chunk_id")
     b0 = sl.start * sector_size - int(_get(chunk, "offset"))
     b1 = sl.end * sector_size - int(_get(chunk, "offset"))
+    all_attempts = sl.reads + sl.errors + sl.fills
     attempt_ids = [_get(a, "attempt_id")
-                   for a in sorted(sl.reads + sl.errors + sl.fills,
+                   for a in sorted(all_attempts,
                                    key=lambda a: order_index[_get(
                                        a, "attempt_id")])]
-    latest_session: Optional[str] = None
 
     def base(**kw) -> FinalSegment:
         return FinalSegment(
             start_sector=sl.start, end_sector=sl.end, chunk_id=cid,
-            session_id=latest_session, attempts=attempt_ids, **kw)
+            attempts=attempt_ids, **kw)
 
-    # ----------------------------------------------- successful reads win ----
-    if sl.reads:
-        # exact-range success conflict: two reads of the same sectors claiming
-        # different tool-reported digests can never be reconciled
-        by_range: dict[tuple[int, int], list[Any]] = {}
-        for a in sl.reads:
-            by_range.setdefault(
-                (int(_get(a, "start_sector")), int(_get(a, "end_sector"))),
-                []).append(a)
-        for (r0, r1), group in by_range.items():
-            digests = {_get(a, "sha256") for a in group if _get(a, "sha256")}
-            if len(digests) > 1:
-                out("error", "ATTEMPT_SUCCESS_CONFLICT",
-                    f"sectors [{r0},{r1}) have {len(digests)} distinct "
-                    f"successful read digests; later retries may supersede "
-                    f"failures but successful reads of the same range must "
-                    f"agree",
-                    chunk_ids=[cid],
-                    session_id=_get(group[0], "session_id"),
-                    start_sector=max(r0, sl.start),
-                    end_sector=min(r1, sl.end),
-                    detail={"attempt_ids": [_get(a, "attempt_id") for a in group],
-                            "digests": sorted(digests)})
+    if not all_attempts:
+        # covered by a final chunk but no attempt explains its bytes
+        out("error", "ATTEMPT_PROVENANCE_MISSING",
+            f"sectors [{sl.start},{sl.end}) of chunk {cid} have no read "
+            f"attempt on record; the manifest cannot show whether the bytes "
+            f"were read from the source or padded after a bad-sector error",
+            chunk_ids=[cid], start_sector=sl.start, end_sector=sl.end)
+        return FinalSegment(start_sector=sl.start, end_sector=sl.end,
+                            chunk_id=cid, session_id=None, kind="unrecovered",
+                            content_ok=False)
 
-        winner = _latest(sl.reads, order_index)
-        latest_session = _get(winner, "session_id")
+    # final intent: the highest-round attempt touching this slice wins; ties
+    # resolve by submission order, so a later round-2 fill supersedes an
+    # earlier round-1 read (and vice versa), while every earlier attempt --
+    # including failures -- stays in the log.
+    winner = _latest(all_attempts, order_index)
+    latest_session = _get(winner, "session_id")
 
-        # every tool-reported digest of a successful read must recompute from
-        # the actual chunk bytes (whole attempt range)
-        winner_digest_ok = True
-        actual_digest: Optional[str] = None
-        for a in sl.reads:
-            declared = _get(a, "sha256")
-            ar = resolver.read_range(
-                chunk,
-                int(_get(a, "start_sector")) * sector_size
-                - int(_get(chunk, "offset")),
-                int(_get(a, "end_sector")) * sector_size
-                - int(_get(chunk, "offset")))
-            if not ar.readable:
-                out("error", "ATTEMPT_CONTENT_UNVERIFIABLE",
-                    f"successful read attempt {_get(a, 'attempt_id')} cannot "
-                    f"be recomputed from the bound chunk {cid} "
-                    f"({ar.error_code})",
-                    chunk_ids=[cid], session_id=_get(a, "session_id"),
-                    start_sector=max(int(_get(a, "start_sector")), sl.start),
-                    end_sector=min(int(_get(a, "end_sector")), sl.end),
-                    detail={"attempt_id": _get(a, "attempt_id"),
-                            "error_code": ar.error_code})
-                winner_digest_ok = False
-                continue
-            digest = sha256_hex(ar.data)
-            if a is winner:
-                actual_digest = digest
-            if declared and declared != digest:
-                winner_digest_ok = False
-                out("error", "ATTEMPT_CONTENT_DIGEST_MISMATCH",
-                    f"successful read attempt {_get(a, 'attempt_id')} digest "
-                    f"does not recompute from the bytes of bound chunk {cid}",
-                    chunk_ids=[cid], session_id=_get(a, "session_id"),
-                    start_sector=max(int(_get(a, "start_sector")), sl.start),
-                    end_sector=min(int(_get(a, "end_sector")), sl.end),
-                    detail={"attempt_id": _get(a, "attempt_id"),
-                            "declared": declared, "actual": digest})
+    # ---- validate every successful read against the bound chunk bytes -----
+    success_conflict = False
+    by_range: dict[tuple[int, int], list[Any]] = {}
+    for a in sl.reads:
+        by_range.setdefault(
+            (int(_get(a, "start_sector")), int(_get(a, "end_sector"))),
+            []).append(a)
+    for (r0, r1), group in by_range.items():
+        digests = {_get(a, "sha256") for a in group if _get(a, "sha256")}
+        if len(digests) > 1:
+            success_conflict = True
+            out("error", "ATTEMPT_SUCCESS_CONFLICT",
+                f"sectors [{r0},{r1}) have {len(digests)} distinct "
+                f"successful read digests; later retries may supersede "
+                f"failures but successful reads of the same range must agree",
+                chunk_ids=[cid], session_id=_get(group[0], "session_id"),
+                start_sector=max(r0, sl.start), end_sector=min(r1, sl.end),
+                detail={"attempt_ids": [_get(a, "attempt_id") for a in group],
+                        "digests": sorted(digests)})
 
-        return base(kind="read",
+    read_digest_ok = True
+    winner_actual_digest: Optional[str] = None
+    for a in sl.reads:
+        declared = _get(a, "sha256")
+        ar = resolver.read_range(
+            chunk,
+            int(_get(a, "start_sector")) * sector_size
+            - int(_get(chunk, "offset")),
+            int(_get(a, "end_sector")) * sector_size
+            - int(_get(chunk, "offset")))
+        if not ar.readable:
+            read_digest_ok = False
+            out("error", "ATTEMPT_CONTENT_UNVERIFIABLE",
+                f"successful read attempt {_get(a, 'attempt_id')} cannot be "
+                f"recomputed from the bound chunk {cid} ({ar.error_code})",
+                chunk_ids=[cid], session_id=_get(a, "session_id"),
+                start_sector=max(int(_get(a, "start_sector")), sl.start),
+                end_sector=min(int(_get(a, "end_sector")), sl.end),
+                detail={"attempt_id": _get(a, "attempt_id"),
+                        "error_code": ar.error_code})
+            continue
+        digest = sha256_hex(ar.data)
+        if a is winner:
+            winner_actual_digest = digest
+        if declared and declared != digest:
+            read_digest_ok = False
+            out("error", "ATTEMPT_CONTENT_DIGEST_MISMATCH",
+                f"successful read attempt {_get(a, 'attempt_id')} digest "
+                f"does not recompute from the bytes of bound chunk {cid}",
+                chunk_ids=[cid], session_id=_get(a, "session_id"),
+                start_sector=max(int(_get(a, "start_sector")), sl.start),
+                end_sector=min(int(_get(a, "end_sector")), sl.end),
+                detail={"attempt_id": _get(a, "attempt_id"),
+                        "declared": declared, "actual": digest})
+
+    winner_result = _get(winner, "result")
+
+    # ------------------------------------------------------- final read -----
+    if winner_result == "read":
+        return base(kind="read", session_id=latest_session,
                     winning_attempt_id=_get(winner, "attempt_id"),
-                    sha256=actual_digest, content_ok=winner_digest_ok)
+                    sha256=winner_actual_digest,
+                    content_ok=read_digest_ok and not success_conflict)
 
-    # ----------------------------------------------- fills supersede earlier
-    # failures for the final segment (failure records stay in attempts) ------
-    if sl.fills:
-        winner = _latest(sl.fills, order_index)
-        latest_session = _get(winner, "session_id")
+    # ------------------------------------------------------- final fill -----
+    if winner_result == "fill":
         method = _get(winner, "fill_method")
         fill_ok = True
         if method in ("zero-pad", "pattern-pad"):
@@ -647,26 +667,14 @@ def _resolve_slice(sl: _Slice, sector_size: int, resolver,
                 start_sector=sl.start, end_sector=sl.end,
                 detail={"attempt_id": _get(winner, "attempt_id")})
 
-        return base(kind="fill", winning_attempt_id=_get(winner, "attempt_id"),
+        return base(kind="fill", session_id=latest_session,
+                    winning_attempt_id=_get(winner, "attempt_id"),
                     fill_method=method, fill_value=_get(winner, "fill_value"),
                     sparse_hole=bool(_get(winner, "sparse_hole")),
                     content_ok=fill_ok)
 
-    # ------------------------------------------------------------- failures --
-    if sl.errors:
-        winner = _latest(sl.errors, order_index)
-        latest_session = _get(winner, "session_id")
-        return base(kind="unrecovered",
-                    winning_attempt_id=_get(winner, "attempt_id"),
-                    tool_error_code=_get(winner, "tool_error_code"),
-                    content_ok=False)
-
-    # covered by a final chunk but no attempt explains its bytes
-    out("error", "ATTEMPT_PROVENANCE_MISSING",
-        f"sectors [{sl.start},{sl.end}) of chunk {cid} have no read attempt "
-        f"on record; the manifest cannot show whether the bytes were read "
-        f"from the source or padded after a bad-sector error",
-        chunk_ids=[cid], start_sector=sl.start, end_sector=sl.end)
-    return FinalSegment(start_sector=sl.start, end_sector=sl.end,
-                        chunk_id=cid, session_id=None, kind="unrecovered",
-                        content_ok=False)
+    # ------------------------------------------------ final failed read -----
+    return base(kind="unrecovered", session_id=latest_session,
+                winning_attempt_id=_get(winner, "attempt_id"),
+                tool_error_code=_get(winner, "tool_error_code"),
+                content_ok=False)

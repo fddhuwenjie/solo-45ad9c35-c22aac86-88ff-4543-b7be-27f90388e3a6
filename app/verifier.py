@@ -438,12 +438,19 @@ def evaluate(payload,
     report.provenance_path = chain.chain_path
 
     # ------------------------------------------------------------- verdict ---
-    # content_ok is False for genuinely unrecovered segments; those stop
-    # mattering only when a documented exception explicitly accepts them
-    # (freeze_ok already enforces the policy on everything unaccepted).
-    recovery_ok = (recovery.freeze_ok and all(
-        s.content_ok or (s.kind == "unrecovered" and s.exception_id is not None)
-        for s in recovery.segments))
+    # A segment is source-proven when its read/fill content re-verified, or
+    # when a genuinely unrecovered range was accepted by a documented
+    # exception (freeze_ok already bounds what may stay unaccepted). Sectors
+    # without any read-attempt record (unattested) and coverage gaps are never
+    # sealable: a matching digest does not prove the bytes came from the
+    # source medium.
+    def _segment_ok(s) -> bool:
+        if s.kind == "unrecovered":
+            return s.exception_id is not None
+        return s.kind in ("read", "fill") and s.content_ok
+
+    recovery_ok = (recovery.freeze_ok
+                   and all(_segment_ok(s) for s in recovery.segments))
     has_errors = any(f.severity == Severity.error for f in report.findings)
     report.sealable = (not has_errors
                        and recovery_ok

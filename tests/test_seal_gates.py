@@ -434,6 +434,12 @@ def _correction_payload(parent_id, media_id, *, make_old_unreadable=False,
                       "correction_of": "C02",
                       "note": "re-imaged after read error on sector 16"})
     p2["chunks"].append(corrected)
+    p2.setdefault("read_attempts", []).append({
+        "attempt_id": "A-C02X", "session_id": corrected["session_id"],
+        "chunk_id": "C02X", "start_sector": 16, "end_sector": 32,
+        "round": 2, "result": "read",
+        "actual_read_length": 16 * 512,
+        "sha256": hashlib.sha256(data).hexdigest()})
     new_image = b"".join(data if i == 1 else chunk_bytes(i)
                          for i in range(4))
     expected = hashlib.sha256(new_image).hexdigest()
@@ -565,6 +571,12 @@ def test_correction_with_old_chunk_file_on_disk_verifies_and_seals(
                       "stored_path": None,
                       "note": "re-imaged after read error"})
     p2["chunks"].append(corrected)
+    p2.setdefault("read_attempts", []).append({
+        "attempt_id": "A-C02X", "session_id": corrected["session_id"],
+        "chunk_id": "C02X", "start_sector": 16, "end_sector": 32,
+        "round": 2, "result": "read",
+        "actual_read_length": 16 * 512,
+        "sha256": hashlib.sha256(data).hexdigest()})
     new_image = b"".join(data if i == 1 else chunk_bytes(i)
                          for i in range(4))
     expected = hashlib.sha256(new_image).hexdigest()
