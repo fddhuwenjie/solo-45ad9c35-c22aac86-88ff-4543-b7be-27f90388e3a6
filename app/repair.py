@@ -452,8 +452,10 @@ def evaluate_repair_execution(*, plan: RepairPlanReport,
     medium may have degraded since the joint inspection), the write digest
     must equal the read digest, and finally the recomputed whole-disk
     SHA-256 and Merkle root of the repaired target must equal the sealed
-    image roots. Only then is the new derived replica with its handover
-    events registered; any failure is stored and nothing is registered.
+    image roots. The handover must also be documented: at least one custody
+    event, and every event digest equal to the verified derived-replica
+    digest. Only then is the new derived replica with its handover events
+    registered; any failure is stored and nothing is registered.
     """
     media_id = plan.media_id
     findings: list[Finding] = []
@@ -608,7 +610,36 @@ def evaluate_repair_execution(*, plan: RepairPlanReport,
                   f"a repaired medium must be registered under a new "
                   f"replica id",
                   replica_ids=[rid])
+        # A completing execution registers the repaired medium TOGETHER WITH
+        # its handover events: at least one event must be on record, and
+        # every event digest must equal the verified whole-disk SHA-256 of
+        # the derived replica (whose Merkle root was verified against the
+        # sealed image above). An empty handover or a digest that disagrees
+        # with the verified replica keeps the execution failed and registers
+        # nothing.
+        if not payload.custody_events:
+            error("REPAIR_CUSTODY_EVENTS_MISSING",
+                  "a completing execution must register at least one "
+                  "handover event for the derived replica; an empty "
+                  "custody_events list cannot document the handover",
+                  replica_ids=[rid])
         else:
+            mismatched = [
+                e.event_id for e in payload.custody_events
+                if any(d != payload.final_sha256
+                       for d in (e.digest_before, e.digest_after,
+                                 e.expected_digest) if d)]
+            if mismatched:
+                error("REPAIR_CUSTODY_DIGEST_MISMATCH",
+                      "every handover event digest must equal the verified "
+                      "whole-disk SHA-256 of the derived replica (registered "
+                      "with the sealed Merkle root); the listed events "
+                      "declare a different digest",
+                      replica_ids=[rid],
+                      detail={"event_ids": mismatched,
+                              "derived_sha256": payload.final_sha256,
+                              "derived_merkle_root": payload.final_merkle_root})
+        if not has_errors():
             derived = RepairDerivedReplica(
                 replica_id=rid, manifest_id=plan.manifest_id,
                 plan_id=plan.plan_id, execution_id=payload.execution_id,

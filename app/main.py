@@ -908,8 +908,10 @@ def create_repair_execution(manifest_id: str, plan_id: str,
     digest must equal the read digest, and device errors are stored per
     interval. When every interval is written, the recomputed whole-disk
     SHA-256 and Merkle root of the repaired target must equal the sealed
-    image roots — only then is the new derived replica with its handover
-    events registered. A failed execution is stored and registers nothing;
+    image roots, and the handover must be documented by at least one
+    custody event whose digests all equal the verified derived-replica
+    digest — only then is the new derived replica with its handover events
+    registered. A failed execution is stored and registers nothing;
     an existing execution_id is never overwritten (409).
     """
     plan_row = get_repair_plan(conn, manifest_id, plan_id)
