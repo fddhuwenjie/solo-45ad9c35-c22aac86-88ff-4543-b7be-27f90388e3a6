@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from tests.conftest import (
     SECTOR_SIZE,
     TOTAL_SECTORS,
     build_payload,
+    chunk_bytes,
     post_manifest,
     seal,
     total_image_bytes,
@@ -453,3 +455,202 @@ def test_sample_plan_generator_properties():
     assert generate_sample_plan(64, [16, 32, 48], 1.0, "seed") == [[0, 64]]
     # empty medium -> empty plan
     assert generate_sample_plan(0, [], 0.5, "seed") == []
+
+
+# -------------------------------- frozen baseline: reference file rewritten --
+def _sealed_file_manifest(client, evidence_root, media_id):
+    """Seal a manifest whose chunks are file-backed under a temp evidence root."""
+    payload = build_payload(media_id=media_id, with_content=True)
+    paths = write_chunk_files(payload, evidence_root)  # strips inline content
+    mid = post_manifest(client, payload).json()["manifest_id"]
+    assert seal(client, mid).status_code == 200
+    return mid, paths
+
+
+def test_rewritten_source_file_does_not_implicate_unchanged_copy(
+        client, evidence_root):
+    """Sealing freezes the per-chunk baseline. If the registered reference file
+    is rewritten *after* sealing, an inspection of an unchanged copy that
+    submits the original correct digests must be inconclusive (frozen baseline
+    no longer restorable) -- never a digest conflict against the new bytes."""
+    mid, paths = _sealed_file_manifest(client, evidence_root, "M-REBASE")
+    plan = get_plan(client, mid)
+
+    # the source file backing C02 (sectors 16..31) is silently overwritten
+    # in place with same-length but different bytes after sealing
+    target = Path(paths[1])
+    target.write_bytes(b"\x99" * (SECTOR_SIZE * 16))
+
+    # the replica itself is untouched: readings are the ORIGINAL correct
+    # digests, computed from the sealed image bytes
+    readings = make_readings(plan["planned_intervals"])
+    rep = submit(client, mid, plan, readings=readings).json()
+
+    assert rep["result"] == "inconclusive"
+    codes_ = [f["code"] for f in rep["findings"]]
+    # no replica digest conflict: the copy is not the thing that changed
+    assert "INSPECTION_DIGEST_CONFLICT" not in codes_
+    assert "INSPECTION_EXPECTED_UNRECOMPUTABLE" in codes_
+    unv = [f for f in rep["findings"]
+           if f["code"] == "INSPECTION_EXPECTED_UNRECOMPUTABLE"]
+    # exactly the two seam intervals straddling rewritten chunk C02
+    assert sorted((f["start_sector"], f["end_sector"]) for f in unv) == \
+        [(15, 17), (31, 33)]
+    assert all(f["replica_ids"] == ["R-ARC"] for f in unv)
+
+    statuses = {(iv["start_sector"], iv["end_sector"]): iv["status"]
+                for iv in rep["intervals"]}
+    assert statuses[(15, 17)] == "unverifiable"
+    assert statuses[(31, 33)] == "unverifiable"
+    # intervals wholly inside untouched chunks still verify from the baseline
+    for key in ((0, 1), (47, 49), (63, 64)):
+        assert statuses[key] == "match"
+    # the read genuinely returned bytes, so it is covered but not verified
+    assert rep["planned_sectors"] == 8
+    assert rep["covered_sectors"] == 8
+    assert rep["verified_sectors"] == 4
+    assert rep["coverage_rate"] == 1.0
+    assert rep["verified_rate"] == 0.5
+    assert rep["divergent_intervals"] == []
+    assert rep["first_change_at"] is None
+
+    # history must not invent a divergence either; binding is unchanged
+    history = client.get(f"/manifests/{mid}/inspection-report").json()
+    assert history["divergent_intervals"] == []
+    assert history["ever_failed"] is False
+    pkg = client.get(f"/manifests/{mid}/evidence-package").json()
+    assert rep["evidence_package_digest"] == pkg["evidence_package_digest"]
+    assert history["evidence_package_digest"] == pkg["evidence_package_digest"]
+
+
+def test_truncated_source_file_makes_touching_intervals_inconclusive(
+        client, evidence_root):
+    """A truncated reference file equally destroys the frozen baseline for the
+    intervals touching it; correct copy digests never become conflicts."""
+    mid, paths = _sealed_file_manifest(client, evidence_root, "M-RETRUNC")
+    plan = get_plan(client, mid)
+    Path(paths[1]).write_bytes(chunk_bytes(1)[: SECTOR_SIZE * 8])  # C02 half gone
+
+    rep = submit(client, mid, plan,
+                 readings=make_readings(plan["planned_intervals"]),
+                 inspection_id="I-T1").json()
+    assert rep["result"] == "inconclusive"
+    codes_ = [f["code"] for f in rep["findings"]]
+    assert "INSPECTION_DIGEST_CONFLICT" not in codes_
+    unv = sorted((f["start_sector"], f["end_sector"])
+                 for f in rep["findings"]
+                 if f["code"] == "INSPECTION_EXPECTED_UNRECOMPUTABLE")
+    assert unv == [(15, 17), (31, 33)]
+
+
+def test_corrupt_copy_against_intact_baseline_still_fails(client, evidence_root):
+    """Guard the other direction: while the frozen baseline is intact, a copy
+    that really returns different bytes is still proven failed."""
+    mid, _ = _sealed_file_manifest(client, evidence_root, "M-REOK")
+    plan = get_plan(client, mid)
+    readings = make_readings(plan["planned_intervals"], corrupt={(15, 17)})
+    rep = submit(client, mid, plan, readings=readings,
+                 inspection_id="I-C1").json()
+    assert rep["result"] == "failed"
+    codes_ = [f["code"] for f in rep["findings"]]
+    assert "INSPECTION_DIGEST_CONFLICT" in codes_
+    assert "INSPECTION_EXPECTED_UNRECOMPUTABLE" not in codes_
+
+
+# -------------------- cumulative coverage only merges real successful reads --
+def test_history_coverage_excludes_missing_failed_duplicate_oob(client):
+    mid = sealed_manifest(client, "M-COVCAL")
+    plan = get_plan(client, mid, seed="cov-seed", ratio=0.25)
+    intervals = plan["planned_intervals"]
+    assert len(intervals) >= 4
+
+    # I-1: one interval duplicated, one skipped (missing), one read error,
+    # one out-of-plan reading and one beyond geometry; the rest read fine.
+    dup_iv, skip_iv, err_iv = intervals[0], intervals[1], intervals[2]
+    good = make_readings(intervals[3:])
+    dup_reading = make_readings([dup_iv])
+    readings = list(dup_reading)
+    readings.append(dict(dup_reading[0]))  # duplicate of the same interval
+    readings.append(make_readings([err_iv], error_for={
+        (err_iv["start_sector"], err_iv["end_sector"])})[0])
+    readings += good
+
+    planned_sectors_set = {s for iv in intervals
+                           for s in range(iv["start_sector"], iv["end_sector"])}
+    sampled_sectors = {s for iv in intervals
+                       for s in range(iv["start_sector"], iv["end_sector"])}
+    sampled_sectors -= set(range(skip_iv["start_sector"], skip_iv["end_sector"]))
+    sampled_sectors -= set(range(err_iv["start_sector"], err_iv["end_sector"]))
+
+    free = next(s for s in range(TOTAL_SECTORS - 1)
+                if s not in planned_sectors_set and s + 1 not in planned_sectors_set)
+    readings.append({"start_sector": free, "end_sector": free + 1,
+                     "read_at": T_READ.isoformat(),
+                     "sha256": interval_digest(free, free + 1)})
+    readings.append({"start_sector": 63, "end_sector": 65,
+                     "read_at": T_READ.isoformat(), "sha256": "b" * 64})
+
+    r1 = submit(client, mid, plan, inspection_id="I-1", seed="cov-seed",
+                ratio=0.25, readings=readings)
+    assert r1.status_code == 201, r1.text
+    rep1 = r1.json()
+    assert rep1["result"] == "inconclusive"
+    fcodes = [f["code"] for f in rep1["findings"]]
+    assert "INSPECTION_INTERVAL_MISSING" in fcodes
+    assert "INSPECTION_READ_FAILED" in fcodes
+    assert "INSPECTION_READING_DUPLICATE" in fcodes
+    assert fcodes.count("INSPECTION_READING_OUT_OF_BOUNDS") == 2
+    expected_covered = len(sampled_sectors)
+    assert rep1["planned_sectors"] == len(planned_sectors_set)
+    assert rep1["covered_sectors"] == expected_covered
+    assert rep1["verified_sectors"] == expected_covered
+
+    history = client.get(f"/manifests/{mid}/inspection-report").json()
+    # missing/read-failed intervals are not covered; duplicate/oob readings
+    # contribute nothing
+    assert history["cumulative_coverage_rate"] == \
+        expected_covered / TOTAL_SECTORS
+    assert history["cumulative_coverage_rate"] < \
+        len(planned_sectors_set) / TOTAL_SECTORS
+
+    # I-2: now genuinely read the two intervals I-1 did not, plus an
+    # out-of-plan reading that must still be ignored; other plan intervals
+    # stay missing in this run (they were already covered by I-1).
+    fill = make_readings([skip_iv, err_iv],
+                         read_at=T_READ + timedelta(days=1))
+    fill.append({"start_sector": free, "end_sector": free + 1,
+                 "read_at": (T_READ + timedelta(days=1)).isoformat(),
+                 "sha256": interval_digest(free, free + 1)})
+    rep2 = submit(client, mid, plan, inspection_id="I-2", seed="cov-seed",
+                  ratio=0.25, readings=fill).json()
+    assert rep2["result"] == "inconclusive"  # remaining intervals missing + oob
+    assert rep2["covered_sectors"] == \
+        (skip_iv["end_sector"] - skip_iv["start_sector"]) + \
+        (err_iv["end_sector"] - err_iv["start_sector"])
+
+    history2 = client.get(f"/manifests/{mid}/inspection-report").json()
+    assert history2["cumulative_coverage_rate"] == \
+        len(planned_sectors_set) / TOTAL_SECTORS
+
+    # I-3: repeat I-2's genuine reads; union coverage must not grow and the
+    # history stays append-only
+    rep3 = submit(client, mid, plan, inspection_id="I-3", seed="cov-seed",
+                  ratio=0.25,
+                  readings=make_readings([skip_iv, err_iv],
+                                         read_at=T_READ + timedelta(days=2)),
+                  device_id="READER-02").json()
+    assert rep3["result"] == "inconclusive"
+    history3 = client.get(f"/manifests/{mid}/inspection-report").json()
+    assert history3["inspection_count"] == 3
+    assert history3["cumulative_coverage_rate"] == \
+        len(planned_sectors_set) / TOTAL_SECTORS
+    assert [i["inspection_id"] for i in history3["inspections"]] == \
+        ["I-1", "I-2", "I-3"]
+    # bound evidence package survives all of this
+    pkg = client.get(f"/manifests/{mid}/evidence-package").json()
+    assert history3["evidence_package_digest"] == \
+        pkg["evidence_package_digest"]
+    # saved inspection records were not rewritten by later runs
+    stored1 = client.get(f"/manifests/{mid}/inspections/I-1").json()
+    assert stored1 == rep1
+

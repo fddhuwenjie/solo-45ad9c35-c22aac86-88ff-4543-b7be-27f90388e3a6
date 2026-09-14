@@ -504,10 +504,21 @@ def inspection_history(manifest_id: str,
     results: dict[str, int] = {}
     sampled: set[int] = set()
     divergent: dict[tuple[str, int, int], dict[str, Any]] = {}
+    # Only intervals the tool genuinely read off a replica count toward
+    # cumulative coverage: an in-plan, non-duplicate reading that returned
+    # bytes -- matching, conflicting, or with an unrecomputable frozen
+    # baseline. Planned-but-missing intervals and reported read failures are
+    # not "covered", and duplicate/out-of-plan readings never reach the
+    # per-interval results. Union across inspections de-duplicates repeats.
+    read_statuses = {"match", "digest-conflict", "unverifiable"}
     for rep in reports:
         results[rep.result] = results.get(rep.result, 0) + 1
+        status_by_interval = {(iv.start_sector, iv.end_sector): iv.status
+                              for iv in rep.intervals}
         for iv in rep.planned_intervals:
-            sampled.update(range(iv.start_sector, iv.end_sector))
+            if status_by_interval.get((iv.start_sector, iv.end_sector)) \
+                    in read_statuses:
+                sampled.update(range(iv.start_sector, iv.end_sector))
         for d in rep.divergent_intervals:
             key = (d.replica_id, d.start_sector, d.end_sector)
             when = as_utc(d.first_change_at or d.read_at)

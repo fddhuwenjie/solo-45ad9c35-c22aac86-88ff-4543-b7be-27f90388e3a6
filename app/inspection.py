@@ -11,7 +11,13 @@ ratio, the chunk boundaries, the read timestamps and the device identity.
 The service deterministically regenerates the sample set from the seed —
 always covering the first and last sector and every chunk seam, filled up to
 the requested ratio with random sectors — and compares each submitted
-reading against the sealed evidence package interval by interval.
+reading against the sealed evidence package interval by interval. Expected
+digests come exclusively from the baseline frozen at sealing time: inline
+chunk bytes are embedded in the sealed submission, while a file-backed chunk
+must first re-read to exactly its sealed length and SHA-256. A reference
+file rewritten, truncated or deleted after sealing cannot restore that
+baseline, so the affected interval is inconclusive — an unchanged copy's
+correct digest can never be reported as a conflict.
 
 Verdicts:
 
@@ -119,15 +125,59 @@ def internal_seams(ranges: list[tuple[str, int, int]]) -> list[int]:
     return sorted(s0 for _, s0, _ in ranges if s0 > 0)
 
 
+def sealed_baseline_ok(chunk: Any, resolver: Any,
+                       cache: dict[str, bool]) -> bool:
+    """Whether the digest frozen at sealing time can still be reproduced for
+    this chunk from the bytes available at inspection time.
+
+    Inline content is embedded in the sealed submission itself, so its
+    baseline is always restorable. A file-backed chunk only registered a
+    ``stored_path``: its current bytes witness the sealed baseline *only*
+    when they still re-read to exactly the length and SHA-256 frozen at seal
+    time. A reference file rewritten, truncated or deleted after sealing must
+    never masquerade as the baseline — otherwise an unchanged copy would be
+    falsely reported as corrupt. Such a chunk yields an inconclusive
+    interval, never a digest conflict.
+    """
+    cid = chunk.chunk_id
+    cached = cache.get(cid)
+    if cached is not None:
+        return cached
+    if chunk.content_b64 is not None:
+        cache[cid] = True
+        return True
+    inspect = getattr(resolver, "inspect", None)
+    if inspect is not None:
+        result = inspect(chunk)
+        ok = bool(result.readable and result.length == chunk.length
+                  and result.sha256 == chunk.sha256)
+    else:
+        # Resolvers exposing only the byte-range API: re-read the whole chunk
+        # and compare its length/digest with the frozen baseline directly.
+        result = resolver.read_range(chunk, 0, chunk.length)
+        ok = (result.readable and result.data is not None
+              and len(result.data) == chunk.length
+              and hashlib.sha256(result.data).hexdigest() == chunk.sha256)
+    cache[cid] = ok
+    return ok
+
+
 def expected_interval_digest(payload: Any,
                              ranges: list[tuple[str, int, int]],
                              sector_size: int,
                              start_sector: int, end_sector: int,
-                             resolver: Any) -> Optional[str]:
+                             resolver: Any,
+                             baseline_cache: dict[str, bool]) -> Optional[str]:
     """Recompute the sealed digest of one sampled interval from the actual
     chunk bytes (inline content or registered files). An interval may span a
     chunk seam, so the bytes are assembled slice by slice in offset order.
-    Returns None when any required byte range is no longer readable.
+
+    Every file-backed slice is first authenticated against the chunk digest
+    frozen at sealing time: expected digests come exclusively from the frozen
+    baseline, never from whatever a registered path happens to hold now.
+    Returns None when any required slice is no longer readable, or when the
+    current bytes no longer reproduce the frozen baseline — the caller must
+    then mark the interval unverifiable (inconclusive), not conflicting.
     """
     by_id = {c.chunk_id: c for c in payload.chunks}
     h = hashlib.sha256()
@@ -136,6 +186,8 @@ def expected_interval_digest(payload: Any,
         if lo >= hi:
             continue
         chunk = by_id[cid]
+        if not sealed_baseline_ok(chunk, resolver, baseline_cache):
+            return None
         result = resolver.read_range(chunk, (lo - c0) * sector_size,
                                      (hi - c0) * sector_size)
         if not result.readable or result.data is None:
@@ -252,6 +304,9 @@ def evaluate_inspection(payload: InspectionCreate,
         by_interval[key] = rd
 
     # --------------------------------------- per-interval digest comparison --
+    # Cache of frozen-baseline authentication per file-backed chunk: at most
+    # one full re-read per chunk even when many sampled intervals overlap it.
+    baseline_cache: dict[str, bool] = {}
     prior_first = _prior_divergences(prior_reports)
     intervals: list[InspectionIntervalResult] = []
     divergent: list[DivergentInterval] = []
@@ -276,10 +331,12 @@ def evaluate_inspection(payload: InspectionCreate,
                 chunk_ids=chunk_ids))
             continue
 
-        covered_sectors += s1 - s0
-        expected = expected_interval_digest(sealed_payload, ranges,
-                                            sector_size, s0, s1, resolver)
+        # A read that the tool reported as failed did not return any bytes,
+        # so it cannot contribute to covered or verified sectors.
         if rd.error:
+            expected = expected_interval_digest(sealed_payload, ranges,
+                                                sector_size, s0, s1, resolver,
+                                                baseline_cache)
             error("INSPECTION_READ_FAILED",
                   f"replica {payload.replica_id} could not read sectors "
                   f"[{s0},{s1}): {rd.error}",
@@ -292,10 +349,18 @@ def evaluate_inspection(payload: InspectionCreate,
                 expected_sha256=expected, read_at=rd.read_at,
                 error=rd.error, chunk_ids=chunk_ids))
             continue
+        # The replica genuinely returned bytes for this in-plan interval, so
+        # it counts as covered even if the frozen baseline is unavailable.
+        covered_sectors += s1 - s0
+        expected = expected_interval_digest(sealed_payload, ranges,
+                                            sector_size, s0, s1, resolver,
+                                            baseline_cache)
         if expected is None:
             error("INSPECTION_EXPECTED_UNRECOMPUTABLE",
                   f"sealed bytes for sectors [{s0},{s1}) are no longer "
-                  f"readable; the expected digest cannot be recomputed",
+                  f"readable or no longer reproduce the digest frozen at "
+                  f"sealing time; the expected digest cannot be recomputed "
+                  f"from the frozen baseline",
                   replica_ids=[payload.replica_id],
                   start_sector=s0, end_sector=s1,
                   detail={"chunk_ids": chunk_ids})

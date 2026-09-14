@@ -562,7 +562,7 @@ class InspectionReport(ForensicModel):
     verified_sectors: int = 0
     total_sectors: int = 0
     sample_coverage: float = 0.0    # planned / total
-    coverage_rate: float = 0.0      # covered (submitted) / planned
+    coverage_rate: float = 0.0      # genuinely read / planned (no read failure)
     verified_rate: float = 0.0      # digest-matched / planned
     intervals: list[InspectionIntervalResult] = Field(default_factory=list)
     divergent_intervals: list[DivergentInterval] = Field(default_factory=list)
