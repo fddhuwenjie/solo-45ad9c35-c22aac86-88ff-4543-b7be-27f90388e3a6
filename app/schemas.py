@@ -436,6 +436,178 @@ class MediaRecord(ForensicModel):
     first_registered_at: datetime
 
 
+# ------------------------------------------- post-seal integrity inspection ----
+# After a sealed image is handed over, the copy's medium can silently rot.
+# Re-hashing the whole disk on every patrol cannot localize damage when a read
+# aborts, and an ad-hoc spot check cannot prove the sampled ranges were not
+# cherry-picked afterwards. An inspection therefore freezes the replica, the
+# random seed, the sampling ratio, the chunk boundaries, the read timestamps
+# and the device identity; the service deterministically regenerates the
+# sample set (first/last sector, chunk seams, random sectors) from the seed
+# and compares each submitted reading against the sealed evidence package.
+
+
+class InspectionDevice(ForensicModel):
+    """Identity of the inspection reader/medium, frozen into the record."""
+
+    device_id: str = Field(min_length=1,
+                           description="Unique identifier of the inspection "
+                                       "device / copy medium being read")
+    model: Optional[str] = None
+    serial: Optional[str] = None
+    interface: Optional[str] = None
+    firmware: Optional[str] = None
+
+
+class InspectionReading(ForensicModel):
+    """One sampled interval actually read off the inspected replica.
+
+    Exactly one of ``sha256`` (digest of the bytes really read) or ``error``
+    (tool-reported read failure) must be present.
+    """
+
+    start_sector: int = Field(ge=0)
+    end_sector: int = Field(ge=0, description="exclusive")
+    read_at: datetime = Field(description="Moment this interval was read")
+    sha256: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="SHA-256 of the bytes actually read over the interval")
+    error: Optional[str] = Field(
+        None, min_length=1,
+        description="Tool-reported read error (e.g. medium-error); the "
+                    "interval could not be read")
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "InspectionReading":
+        if self.end_sector <= self.start_sector:
+            raise ValueError("end_sector must be greater than start_sector")
+        if (self.sha256 is None) == (self.error is None):
+            raise ValueError("a reading must carry exactly one of sha256 "
+                             "(bytes read) or error (read failed)")
+        return self
+
+
+class InspectionCreate(ForensicModel):
+    """Post-seal integrity inspection of one replica of a sealed manifest."""
+
+    inspection_id: str = Field(min_length=1,
+                               description="Unique id; records are append-only "
+                                           "and an existing id is never "
+                                           "overwritten by a re-test")
+    replica_id: str = Field(min_length=1,
+                            description="Replica (from the sealed manifest) "
+                                        "whose medium was sampled")
+    seed: str = Field(min_length=1,
+                      description="Random seed; the service deterministically "
+                                  "regenerates the sample plan from it")
+    sample_ratio: float = Field(
+        gt=0.0, le=1.0,
+        description="Fraction of sectors to sample; head/tail and chunk-seam "
+                    "sectors are always included on top")
+    device: InspectionDevice
+    readings: list[InspectionReading] = Field(
+        default_factory=list,
+        description="One reading per planned sample interval: actual digest "
+                    "or read error")
+    note: Optional[str] = None
+
+
+class InspectionIntervalResult(ForensicModel):
+    """Per planned-interval outcome of one inspection."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    status: Literal["match", "digest-conflict", "read-failed", "missing",
+                    "unverifiable"]
+    expected_sha256: Optional[str] = None
+    actual_sha256: Optional[str] = None
+    read_at: Optional[datetime] = None
+    error: Optional[str] = None
+    chunk_ids: list[str] = Field(default_factory=list)
+
+
+class DivergentInterval(ForensicModel):
+    """A sampled interval whose actual bytes provably differ from the sealed
+    evidence, with the first time the divergence was observed (append-only
+    history: later passing re-tests never erase it)."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    replica_id: str
+    expected_sha256: Optional[str] = None
+    actual_sha256: Optional[str] = None
+    read_at: Optional[datetime] = None
+    first_change_at: Optional[datetime] = None
+    first_inspection_id: Optional[str] = None
+
+
+class InspectionReport(ForensicModel):
+    """Full JSON report of one inspection run, bound to the sealed evidence
+    package it was evaluated against."""
+
+    inspection_id: str
+    manifest_id: str
+    media_id: str
+    replica_id: str
+    result: Literal["passed", "failed", "inconclusive"]
+    seed: str
+    sample_ratio: float
+    device: InspectionDevice
+    chunk_boundaries: list[int] = Field(
+        default_factory=list,
+        description="Frozen internal chunk-seam sectors of the sealed image")
+    planned_intervals: list[SectorInterval] = Field(default_factory=list)
+    planned_sectors: int = 0
+    covered_sectors: int = 0
+    verified_sectors: int = 0
+    total_sectors: int = 0
+    sample_coverage: float = 0.0    # planned / total
+    coverage_rate: float = 0.0      # covered (submitted) / planned
+    verified_rate: float = 0.0      # digest-matched / planned
+    intervals: list[InspectionIntervalResult] = Field(default_factory=list)
+    divergent_intervals: list[DivergentInterval] = Field(default_factory=list)
+    first_change_at: Optional[datetime] = None
+    findings: list[Finding] = Field(default_factory=list)
+    evidence_package_digest: Optional[str] = None
+    image_sha256: Optional[str] = None
+    merkle_root: Optional[str] = None
+    created_at: datetime
+
+
+class InspectionSummary(ForensicModel):
+    inspection_id: str
+    replica_id: str
+    result: str
+    seed: str
+    sample_ratio: float
+    device_id: str
+    planned_sectors: int
+    verified_sectors: int
+    coverage_rate: float
+    created_at: datetime
+
+
+class InspectionHistoryReport(ForensicModel):
+    """Append-only patrol history of one sealed manifest: cumulative coverage,
+    every divergence ever observed with its first-change time, and the bound
+    evidence package. Re-tests add rows; they never overwrite a failure."""
+
+    manifest_id: str
+    media_id: str
+    evidence_package_digest: Optional[str] = None
+    image_sha256: Optional[str] = None
+    merkle_root: Optional[str] = None
+    total_sectors: int = 0
+    inspection_count: int = 0
+    results: dict[str, int] = Field(default_factory=dict)
+    latest_result: Optional[str] = None
+    ever_failed: bool = False
+    cumulative_coverage_rate: float = 0.0
+    divergent_intervals: list[DivergentInterval] = Field(default_factory=list)
+    first_change_at: Optional[datetime] = None
+    inspections: list[InspectionSummary] = Field(default_factory=list)
+
+
 class FieldChange(ForensicModel):
     field: str
     left: Any = None

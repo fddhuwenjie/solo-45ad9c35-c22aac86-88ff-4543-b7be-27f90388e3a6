@@ -113,12 +113,31 @@ CREATE TABLE IF NOT EXISTS recovery_exceptions (
     PRIMARY KEY (manifest_id, exception_id)
 );
 
+-- Post-seal integrity inspections are append-only: every patrol run inserts
+-- a new row keyed by inspection_id; rows are never updated or deleted, so a
+-- re-test can never overwrite an earlier failed/inconclusive result.
+CREATE TABLE IF NOT EXISTS inspections (
+    inspection_id TEXT PRIMARY KEY,
+    manifest_id   TEXT NOT NULL REFERENCES manifests(manifest_id),
+    media_id      TEXT NOT NULL,
+    replica_id    TEXT NOT NULL,
+    seed          TEXT NOT NULL,
+    sample_ratio  REAL NOT NULL,
+    device_json   TEXT NOT NULL,
+    plan_json     TEXT NOT NULL,
+    report_json   TEXT NOT NULL,
+    result        TEXT NOT NULL CHECK (result IN ('passed','failed','inconclusive')),
+    created_at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_manifests_media ON manifests(media_id, revision);
 CREATE INDEX IF NOT EXISTS idx_chunks_offset ON chunks(manifest_id, offset);
 CREATE INDEX IF NOT EXISTS idx_attempts_chunk
     ON read_attempts(manifest_id, chunk_id);
 CREATE INDEX IF NOT EXISTS idx_exceptions_range
     ON recovery_exceptions(manifest_id, start_sector, end_sector);
+CREATE INDEX IF NOT EXISTS idx_inspections_manifest
+    ON inspections(manifest_id, created_at);
 """
 
 
@@ -314,6 +333,45 @@ def mark_sealed(conn: sqlite3.Connection, manifest_id: str, sealed_at: str,
                reconstructed_sha256=?
          WHERE manifest_id=?""",
         (sealed_at, report_json, merkle_root, reconstructed_sha256, manifest_id))
+
+
+# ---------------------------------------------------- inspections (append-only)
+def insert_inspection(conn: sqlite3.Connection, report: Any,
+                      plan: list[list[int]]) -> None:
+    """Append one inspection record. ``report`` is an InspectionReport; the
+    frozen plan (seed-derived intervals) is stored alongside so the record
+    stays auditable even if the sampling algorithm ever changes."""
+    device_json = canonical_json(report.device.model_dump(mode="json"))
+    report_json = canonical_json(report.model_dump(mode="json"))
+    conn.execute(
+        """INSERT INTO inspections (inspection_id, manifest_id, media_id,
+                                    replica_id, seed, sample_ratio, device_json,
+                                    plan_json, report_json, result, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (report.inspection_id, report.manifest_id, report.media_id,
+         report.replica_id, report.seed, report.sample_ratio, device_json,
+         canonical_json(plan), report_json, report.result,
+         report.created_at.isoformat()))
+
+
+def get_inspection(conn: sqlite3.Connection, manifest_id: str,
+                   inspection_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM inspections WHERE manifest_id=? AND inspection_id=?",
+        (manifest_id, inspection_id)).fetchone()
+
+
+def get_inspection_by_id(conn: sqlite3.Connection,
+                         inspection_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM inspections WHERE inspection_id=?",
+                        (inspection_id,)).fetchone()
+
+
+def list_inspections(conn: sqlite3.Connection,
+                     manifest_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM inspections WHERE manifest_id=? "
+        "ORDER BY created_at, inspection_id", (manifest_id,)))
 
 
 def dependency_db() -> Any:

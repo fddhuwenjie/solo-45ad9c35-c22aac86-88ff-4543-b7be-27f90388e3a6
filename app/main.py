@@ -15,14 +15,19 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from .chains import analyze_replica_custody
 from .content import ContentResolver, FilesystemContentResolver
 from .db import (
+    configure,
     get_db,
+    get_inspection,
+    get_inspection_by_id,
     get_manifest,
     get_media,
+    insert_inspection,
     insert_manifest,
+    list_inspections,
     list_manifests,
     mark_sealed,
     save_precheck,
-    configure,
+    utcnow_iso,
 )
 from .evidence import (
     build_evidence_package,
@@ -32,11 +37,22 @@ from .evidence import (
     report_from_json,
 )
 from .hashing import canonical_json, digest_canonical, merkle_root
+from .inspection import (
+    as_utc,
+    chunk_sector_ranges,
+    evaluate_inspection,
+    generate_sample_plan,
+    internal_seams,
+)
 from .recovery import analyze_recovery
 from .schemas import (
     DiffReport,
     EvaluationReport,
     Finding,
+    InspectionCreate,
+    InspectionHistoryReport,
+    InspectionReport,
+    InspectionSummary,
     ManifestCreate,
     ManifestCreated,
     MediaRecord,
@@ -76,13 +92,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Split-Image Forensic Evidence Verification API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Verify segmented disk acquisitions: sector coverage by offset, "
         "chunk-order reconstruction, SHA-256/Merkle roots, write-protector "
         "checks, bad-sector retry/fill provenance and replica/chain-of-custody "
         "digest continuity. Resumes, target swaps and corrections can only "
-        "create new revisions; sealed manifests stay read-only."
+        "create new revisions; sealed manifests stay read-only. Post-seal "
+        "integrity inspections patrol handed-over replicas with a "
+        "seed-deterministic sample plan (head/tail, chunk seams, random "
+        "sectors) and append-only tamper-evident history."
     ),
     lifespan=lifespan,
 )
@@ -331,6 +350,211 @@ def evidence_package(manifest_id: str, conn: sqlite3.Connection = Depends(get_db
         report = _evaluate_with_lineage(conn, payload_from_row(row))
     return build_evidence_package(row, report)
 
+
+# ------------------------------------- post-seal integrity inspection ----
+def _sealed_context(conn: sqlite3.Connection, manifest_id: str):
+    """Load a sealed manifest plus its sealed report and bound package digest.
+
+    Inspections patrol the copies of a *sealed* image; a draft or superseded
+    manifest has no frozen evidence to compare against.
+    """
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    if row["status"] != "sealed":
+        raise HTTPException(409, detail={
+            "code": "INSPECTION_REQUIRES_SEALED",
+            "message": "integrity inspections reference the sealed manifest; "
+                       f"manifest {manifest_id} is '{row['status']}'",
+            "status": row["status"]})
+    sealed_report = report_from_json(row["seal_report_json"])
+    sealed_payload = payload_from_row(row)
+    if sealed_report is None:
+        sealed_report = _evaluate_with_lineage(conn, sealed_payload)
+    package = build_evidence_package(row, sealed_report)
+    return row, sealed_payload, sealed_report, \
+        package["evidence_package_digest"]
+
+
+def _stored_inspection_report(row: sqlite3.Row) -> InspectionReport:
+    return InspectionReport.model_validate(json.loads(row["report_json"]))
+
+
+def _inspection_summary(report: InspectionReport) -> InspectionSummary:
+    return InspectionSummary(
+        inspection_id=report.inspection_id, replica_id=report.replica_id,
+        result=report.result, seed=report.seed,
+        sample_ratio=report.sample_ratio, device_id=report.device.device_id,
+        planned_sectors=report.planned_sectors,
+        verified_sectors=report.verified_sectors,
+        coverage_rate=report.coverage_rate, created_at=report.created_at)
+
+
+@app.get("/manifests/{manifest_id}/inspection-plan")
+def inspection_plan(manifest_id: str,
+                    seed: str = Query(..., min_length=1),
+                    sample_ratio: float = Query(..., gt=0.0, le=1.0),
+                    conn: sqlite3.Connection = Depends(get_db)):
+    """Preview the deterministic sample plan for a seed and sampling ratio.
+
+    The plan always covers the first/last sector and both sectors straddling
+    every chunk seam, filled to the ratio with seeded random sectors. The
+    patrol tool reads exactly these intervals off the replica and submits the
+    digests via POST /manifests/{id}/inspections; because the seed is frozen
+    into the inspection record, anyone can re-derive the plan and prove the
+    sampled ranges were not cherry-picked afterwards.
+    """
+    row, sealed_payload, sealed_report, package_digest_ = \
+        _sealed_context(conn, manifest_id)
+    geom = sealed_payload.media.geometry
+    ranges = chunk_sector_ranges(sealed_payload,
+                                 sealed_report.ordered_chunk_ids,
+                                 geom.sector_size)
+    seams = internal_seams(ranges)
+    plan = generate_sample_plan(geom.total_sectors, seams, sample_ratio, seed)
+    return {
+        "manifest_id": manifest_id,
+        "media_id": row["media_id"],
+        "seed": seed,
+        "sample_ratio": sample_ratio,
+        "chunk_boundaries": seams,
+        "planned_intervals": [{"start_sector": a, "end_sector": b}
+                              for a, b in plan],
+        "planned_sectors": sum(b - a for a, b in plan),
+        "total_sectors": geom.total_sectors,
+        "evidence_package_digest": package_digest_,
+        "image_sha256": sealed_report.reconstructed_sha256,
+        "merkle_root": sealed_report.merkle_root,
+    }
+
+
+@app.post("/manifests/{manifest_id}/inspections",
+          response_model=InspectionReport, status_code=201)
+def create_inspection(manifest_id: str, payload: InspectionCreate,
+                      conn: sqlite3.Connection = Depends(get_db)):
+    """Submit one post-seal integrity inspection (append-only).
+
+    The service regenerates the sample plan from the frozen seed, compares
+    every submitted reading against the sealed evidence package and stores
+    the report. Missing intervals, duplicates, out-of-plan readings, read
+    failures or an unrecomputable expectation mark the run ``inconclusive``;
+    a digest conflict or a broken replica chain marks it ``failed`` — in
+    both cases the finding carries the replica and the sector interval. An
+    existing inspection_id is never overwritten (409).
+    """
+    row, sealed_payload, sealed_report, package_digest_ = \
+        _sealed_context(conn, manifest_id)
+    if get_inspection_by_id(conn, payload.inspection_id) is not None:
+        raise HTTPException(409, detail={
+            "code": "INSPECTION_DUPLICATE",
+            "message": f"inspection {payload.inspection_id} already exists; "
+                       "inspection records are append-only and a re-test "
+                       "must use a new inspection_id",
+            "inspection_id": payload.inspection_id})
+    priors = [_stored_inspection_report(r)
+              for r in list_inspections(conn, manifest_id)]
+    report = evaluate_inspection(
+        payload, manifest_row=row, sealed_payload=sealed_payload,
+        sealed_report=sealed_report, resolver=_content_resolver,
+        prior_reports=priors, evidence_package_digest=package_digest_,
+        created_at=utcnow_iso())
+    plan = [[i.start_sector, i.end_sector] for i in report.planned_intervals]
+    insert_inspection(conn, report, plan)
+    return report
+
+
+@app.get("/manifests/{manifest_id}/inspections",
+         response_model=list[InspectionSummary])
+def list_manifest_inspections(manifest_id: str,
+                              conn: sqlite3.Connection = Depends(get_db)):
+    if get_manifest(conn, manifest_id) is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    return [_inspection_summary(_stored_inspection_report(r))
+            for r in list_inspections(conn, manifest_id)]
+
+
+@app.get("/manifests/{manifest_id}/inspections/{inspection_id}",
+         response_model=InspectionReport)
+def read_inspection(manifest_id: str, inspection_id: str,
+                    conn: sqlite3.Connection = Depends(get_db)):
+    row = get_inspection(conn, manifest_id, inspection_id)
+    if row is None:
+        raise HTTPException(404, f"inspection {inspection_id} not found for "
+                                 f"manifest {manifest_id}")
+    return _stored_inspection_report(row)
+
+
+@app.get("/manifests/{manifest_id}/inspection-report",
+         response_model=InspectionHistoryReport)
+def inspection_history(manifest_id: str,
+                       conn: sqlite3.Connection = Depends(get_db)):
+    """Append-only patrol history of a sealed manifest.
+
+    Aggregates every inspection ever submitted: cumulative sample coverage,
+    all divergent intervals with their first-change time (never erased by
+    later passing re-tests) and the bound evidence package.
+    """
+    row, sealed_payload, sealed_report, package_digest_ = \
+        _sealed_context(conn, manifest_id)
+    reports = [_stored_inspection_report(r)
+               for r in list_inspections(conn, manifest_id)]
+    geom = sealed_payload.media.geometry
+    total_sectors = int(geom.total_sectors)
+
+    results: dict[str, int] = {}
+    sampled: set[int] = set()
+    divergent: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for rep in reports:
+        results[rep.result] = results.get(rep.result, 0) + 1
+        for iv in rep.planned_intervals:
+            sampled.update(range(iv.start_sector, iv.end_sector))
+        for d in rep.divergent_intervals:
+            key = (d.replica_id, d.start_sector, d.end_sector)
+            when = as_utc(d.first_change_at or d.read_at)
+            entry = divergent.get(key)
+            if entry is None:
+                divergent[key] = {
+                    "first_change_at": when,
+                    "first_inspection_id": (d.first_inspection_id
+                                            or rep.inspection_id),
+                    "latest": d}
+            else:
+                if when is not None and (entry["first_change_at"] is None
+                                         or when < entry["first_change_at"]):
+                    entry["first_change_at"] = when
+                    entry["first_inspection_id"] = (d.first_inspection_id
+                                                    or rep.inspection_id)
+                entry["latest"] = d
+
+    divergent_intervals = []
+    for (replica_id, s0, s1), entry in sorted(divergent.items(),
+                                              key=lambda kv: kv[0][1:]):
+        latest = entry["latest"]
+        divergent_intervals.append({
+            "start_sector": s0, "end_sector": s1, "replica_id": replica_id,
+            "expected_sha256": latest.expected_sha256,
+            "actual_sha256": latest.actual_sha256,
+            "read_at": latest.read_at,
+            "first_change_at": entry["first_change_at"],
+            "first_inspection_id": entry["first_inspection_id"]})
+    first_change_at = min((d["first_change_at"] for d in divergent_intervals
+                           if d["first_change_at"] is not None), default=None)
+    return InspectionHistoryReport(
+        manifest_id=manifest_id,
+        media_id=row["media_id"],
+        evidence_package_digest=package_digest_,
+        image_sha256=sealed_report.reconstructed_sha256,
+        merkle_root=sealed_report.merkle_root,
+        total_sectors=total_sectors,
+        inspection_count=len(reports),
+        results=results,
+        latest_result=reports[-1].result if reports else None,
+        ever_failed=any(r.result == "failed" for r in reports),
+        cumulative_coverage_rate=(len(sampled) / total_sectors
+                                  if total_sectors else 1.0),
+        divergent_intervals=divergent_intervals,
+        first_change_at=first_change_at,
+        inspections=[_inspection_summary(r) for r in reports])
 
 @app.get("/media/{media_id}", response_model=MediaRecord)
 def read_media(media_id: str, conn: sqlite3.Connection = Depends(get_db)):

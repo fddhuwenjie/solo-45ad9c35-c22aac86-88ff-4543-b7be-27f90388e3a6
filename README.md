@@ -20,7 +20,9 @@
   `freeze_policy`（绝对扇区数和/或比例，缺省为零容忍）；
 - **分块文件**：块 ID、所属会话、**字节偏移**、长度、SHA-256、可选 Base64 内联内容、纠错关系；
 - **存储副本**：采集件 `acquired`、复制件 `copy`、封存件 `archive` 及其父子链；
-- **交接事件**：采集 / 复制 / 校验 / 封存 / 移交，每个事件的 `digest_before/after`。
+- **交接事件**：采集 / 复制 / 校验 / 封存 / 移交，每个事件的 `digest_before/after`；
+- **封存后巡检**：对已封存清单的副本按**种子确定性抽样计划**实读抽样区间，
+  提交实读摘要或读取错误，逐段比对封存证据包。
 
 服务按偏移把字节区间换算成扇区，核清覆盖、重建块序并计算 **SHA-256 线性总摘要** 与
 **Merkle 根**，再追踪副本摘要从采集→复制→封存→移交的连续链。
@@ -80,6 +82,39 @@
 所有 finding 都携带 `media_id`，并尽量带 `chunk_ids / session_id / replica_ids /
 event_id` 与扇区区间，便于直接定位介质、区间和事件。
 
+## 封存后完整性巡检（只追加）
+
+封存件移交后，副本介质可能**静默损坏**；只重算整盘哈希的巡检在读取中断时
+既无法定位受损扇区，也无法证明抽样范围不是事后临时挑选。本服务对 **sealed**
+清单提供抽样巡检：
+
+1. `GET /manifests/{id}/inspection-plan?seed=&sample_ratio=` 预览**确定性抽样
+   计划**：必含首/尾扇区与每条块接缝两侧扇区，再按种子随机补足抽样比例；
+   同一（种子, 比例, 几何, 块边界）永远生成同一计划，计划绑定证据包摘要。
+2. 巡检工具对副本实读这些区间，记录每区间的实读摘要（或读取错误）、
+   **读取时刻**与**设备标识**。
+3. `POST /manifests/{id}/inspections` 提交巡检：记录冻结**副本、随机种子、
+   抽样比例、块边界、读取时刻、设备标识**；服务按种子重新生成抽样集，
+   从封存证据包逐段复算期望摘要并比对。
+
+判定：
+
+- `failed`：抽样区间实读摘要与封存证据**冲突**（`INSPECTION_DIGEST_CONFLICT`），
+  或**副本链断裂**（副本不在封存清单中 `INSPECTION_REPLICA_UNKNOWN`、副本登记
+  摘要与封存镜像摘要不符 `INSPECTION_REPLICA_DIGEST_MISMATCH`）——副本已被证明改变；
+- `inconclusive`：无实证差异但无法完整核验——区间漏检
+  （`INSPECTION_INTERVAL_MISSING`）、重复提交（`INSPECTION_READING_DUPLICATE`）、
+  越界/超出冻结计划（`INSPECTION_READING_OUT_OF_BOUNDS`）、实读失败
+  （`INSPECTION_READ_FAILED`）或封存字节已不可复算
+  （`INSPECTION_EXPECTED_UNRECOMPUTABLE`）；
+- `passed`：计划区间全部实读且摘要一致。
+
+所有 finding 都携带 `replica_ids` 与扇区区间，直接定位副本和受损扇区。
+**巡检记录只追加**：`inspection_id` 全局唯一，重复提交返回 409，重测必须换新
+ID，永不覆盖失败结果。`GET /manifests/{id}/inspection-report` 汇总全部巡检：
+累计覆盖率、历次结果计数、所有曾出现的差异区间及其**首次变化时间**
+（后续重测通过也不抹除），并绑定证据包摘要、整盘摘要与 Merkle 根。
+
 ### 关键算法
 
 - **覆盖重建**：把每块 `(offset, length)` 换算为扇区区间，扫描线合并，
@@ -124,6 +159,11 @@ event_id` 与扇区区间，便于直接定位介质、区间和事件。
 | `GET  /manifests/{id}/recovery` | 读取尝试日志、最终 read/fill/unrecovered 分段、例外决定与实际源读取率 |
 | `GET  /manifests/{id}/evidence-package` | **可复算 JSON 证据包**（确定性序列化） |
 | `POST /evidence/recompute` | 仅凭证据包原始字段复算全部摘要并逐项给 true/false |
+| `GET  /manifests/{id}/inspection-plan?seed=&sample_ratio=` | 预览种子确定性抽样计划（首/尾、块接缝、随机扇区），绑定证据包 |
+| `POST /manifests/{id}/inspections` | 提交封存后巡检（只追加，201 返回完整巡检报告；重复 ID 409） |
+| `GET  /manifests/{id}/inspections` | 列出该清单全部巡检摘要 |
+| `GET  /manifests/{id}/inspections/{inspection_id}` | 读取单条巡检记录与报告 |
+| `GET  /manifests/{id}/inspection-report` | 巡检历史汇总：累计覆盖率、差异区间、首次变化时间、绑定证据包 |
 | `GET  /diffs?left=&right=` | 两个修订版本比较（参数变化、增删块/会话/副本/事件、根差异） |
 | `GET  /media/{media_id}` | 介质登记（参数在首次登记时冻结） |
 | `GET  /health` | 健康检查 |
@@ -174,9 +214,11 @@ EVIDENCE_ROOTS=/var/evidence:/mnt/raid/acquisitions \
 测试：
 
 ```bash
-pytest -q          # 61 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
+pytest -q          # 77 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
                    # 文件型分块读取/缺件/截断/错序拼接、零副本零事件、证据包复算、
-                   # 坏扇区重试合并/填充溯源/稀疏洞/人工例外/冻结策略/封存原子性等
+                   # 坏扇区重试合并/填充溯源/稀疏洞/人工例外/冻结策略/封存原子性、
+                   # 封存后巡检抽样计划/漏检/重复/越界/摘要冲突/读取失败/
+                   # 副本链断裂/只追加历史与首次变化时间
 ```
 
 ### 请求示例（片段）
@@ -205,6 +247,26 @@ pytest -q          # 61 个用例：覆盖、重叠、错序、纠错、换盘�
 }
 ```
 
+巡检提交示例（`POST /manifests/{id}/inspections`，区间来自
+`GET .../inspection-plan?seed=daily-2026-10-01&sample_ratio=0.25`）：
+
+```json
+{
+  "inspection_id": "INSP-2026-10-01-01",
+  "replica_id": "R-ARC",
+  "seed": "daily-2026-10-01",
+  "sample_ratio": 0.25,
+  "device": {"device_id": "READER-03", "model": "Tableau TD3",
+             "serial": "TD3-7788", "interface": "SATA"},
+  "readings": [
+    {"start_sector": 0, "end_sector": 1,
+     "read_at": "2026-10-01T08:00:00+00:00", "sha256": "<64 hex>"},
+    {"start_sector": 15, "end_sector": 17,
+     "read_at": "2026-10-01T08:00:04+00:00", "error": "medium-error: UNC"}
+  ]
+}
+```
+
 ## 目录结构
 
 ```
@@ -216,8 +278,9 @@ app/
   recovery.py   读取尝试拆段合并、重试取代、填充/稀疏洞溯源、例外与冻结策略
   verifier.py   核验引擎（全部规则，可独立单测）
   evidence.py   证据包构造、修订比较
-  db.py         SQLite 建表、事务化修订写入、封存/预检持久化
+  inspection.py 封存后巡检：种子确定性抽样计划、逐段比对、只追加历史聚合
+  db.py         SQLite 建表、事务化修订写入、封存/预检/巡检持久化
   main.py       FastAPI 路由
-tests/          61 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块、
-                  坏扇区重试/填充溯源/稀疏洞/人工例外/封存原子性）
+tests/          77 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块、
+                  坏扇区重试/填充溯源/稀疏洞/人工例外/封存原子性、封存后抽样巡检）
 ```
