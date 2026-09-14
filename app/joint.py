@@ -29,8 +29,14 @@ replica and classifies:
 
 The task stays ``inconclusive`` while a participating replica is absent, a
 reading falls outside the completion window, the submitted plan intervals
-are incomplete, or an inspection record is referenced more than once. A
-bound inspection that proves a broken replica chain fails the task.
+are incomplete, or an inspection record is referenced more than once.
+
+Verdict precedence: a bound inspection that proves a broken replica chain
+fails the task. A proven digest deviation fails the task only when the
+joint patrol gathered complete evidence — combined with an absent replica,
+an out-of-window reading, incomplete plan intervals or a reused inspection
+record it stays ``inconclusive``: insufficient joint evidence must not be
+overridden by the deviation, and the conflict findings remain on record.
 
 Tasks and bindings are append-only: a re-test binds a new inspection record
 and never rewrites an earlier one, so a later pass can never erase the
@@ -72,6 +78,19 @@ SHAPE_VIOLATION_CODES = {
 READ_STATUSES = {"match", "digest-conflict", "unverifiable"}
 # Cell statuses meaning the interval has no usable reading from a replica.
 MISSING_CELL_STATUSES = {"absent", "missing", "read-failed", "out-of-window"}
+# Finding codes meaning the joint patrol itself could not complete its
+# evidence gathering: a participating replica never submitted, a reading fell
+# outside the frozen completion window, the planned intervals were not fully
+# executed, or an inspection record was referenced more than once. A proven
+# digest deviation cannot finalize the task as ``failed`` while any of these
+# holds -- the cross-replica comparison is incomplete, so the combination
+# stays ``inconclusive`` and the conflict findings remain on record.
+INSUFFICIENT_EVIDENCE_CODES = {
+    "JOINT_REPLICA_ABSENT",
+    "JOINT_READING_OUT_OF_WINDOW",
+    "JOINT_INTERVAL_MISSING",
+    "JOINT_INSPECTION_RECORD_REUSED",
+}
 
 
 @dataclass
@@ -375,7 +394,20 @@ def evaluate_joint_inspection(
                   detail={"inspection_id": insp.inspection_id})
             has_inconclusive = True
 
-    if has_deviation or has_chain_broken:
+    # Verdict precedence: a proven broken replica chain is a hard failure.
+    # A proven digest deviation fails the task only when the joint patrol
+    # gathered complete evidence; while any insufficient-evidence condition
+    # holds (absent replica, out-of-window reading, incomplete plan
+    # intervals, reused inspection record) the deviation stays on record but
+    # the task is inconclusive -- insufficient joint evidence must not be
+    # overridden by the digest deviation.
+    insufficient_evidence = any(f.code in INSUFFICIENT_EVIDENCE_CODES
+                                for f in findings)
+    if has_chain_broken:
+        result = "failed"
+    elif insufficient_evidence:
+        result = "inconclusive"
+    elif has_deviation:
         result = "failed"
     elif has_inconclusive or any(iv.status != "all-match"
                                  for iv in interval_results):

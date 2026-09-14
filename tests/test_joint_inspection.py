@@ -620,6 +620,117 @@ def test_per_replica_coverage_partial_and_cumulative(client):
     assert cov["R-CPY"]["cumulative_coverage_rate"] == 1.0
 
 
+# --------------- conflict + insufficient evidence stays inconclusive -------
+# A proven digest deviation cannot finalize the task as failed while the
+# joint patrol itself is evidence-incomplete: absent replica, out-of-window
+# reading, incomplete plan intervals or a reused inspection record. The
+# conflict findings and the divergence history are preserved either way.
+def test_conflict_with_absent_replica_stays_inconclusive(client):
+    mid = sealed_manifest(client, "M-JCABS")
+    plan = get_plan(client, mid)
+    assert create_joint(client, mid).status_code == 201
+    inspect_and_bind(client, mid, plan, replica_id="R-ACQ",
+                     inspection_id="I-R-ACQ",
+                     readings=make_readings(plan["planned_intervals"],
+                                            corrupt={(15, 17)}))
+    inspect_and_bind(client, mid, plan, replica_id="R-CPY",
+                     inspection_id="I-R-CPY")
+    # R-ARC never binds: the joint comparison is incomplete
+    rep = get_joint(client, mid)
+    assert rep["result"] == "inconclusive"
+    codes = [f["code"] for f in rep["findings"]]
+    assert "JOINT_REPLICA_ABSENT" in codes
+    # the proven conflict stays on record
+    assert "JOINT_DIGEST_CONFLICT" in codes
+    conflict = next(f for f in rep["findings"]
+                    if f["code"] == "JOINT_DIGEST_CONFLICT")
+    assert conflict["replica_ids"] == ["R-ACQ"]
+    assert (conflict["start_sector"], conflict["end_sector"]) == (15, 17)
+    assert interval_status(rep, 15)["status"] == "single-replica-deviation"
+    assert len(rep["divergent_intervals"]) == 1
+    assert rep["divergent_intervals"][0]["replica_id"] == "R-ACQ"
+    assert rep["divergent_intervals"][0]["first_inspection_id"] == "I-R-ACQ"
+    assert rep["ever_failed"] is True
+
+
+def test_conflict_with_out_of_window_reading_stays_inconclusive(client):
+    mid = sealed_manifest(client, "M-JCWIN")
+    plan = get_plan(client, mid)
+    assert create_joint(client, mid).status_code == 201
+    inspect_and_bind(client, mid, plan, replica_id="R-ACQ",
+                     inspection_id="I-R-ACQ",
+                     readings=make_readings(plan["planned_intervals"],
+                                            corrupt={(15, 17)}))
+    inspect_and_bind(client, mid, plan, replica_id="R-CPY",
+                     inspection_id="I-R-CPY")
+    # R-ARC read after the frozen completion window closed
+    late = make_readings(plan["planned_intervals"],
+                         read_at=T_READ + timedelta(days=3))
+    inspect_and_bind(client, mid, plan, replica_id="R-ARC",
+                     inspection_id="I-R-ARC-LATE", readings=late)
+    rep = get_joint(client, mid)
+    assert rep["result"] == "inconclusive"
+    codes = [f["code"] for f in rep["findings"]]
+    assert "JOINT_READING_OUT_OF_WINDOW" in codes
+    assert "JOINT_DIGEST_CONFLICT" in codes
+    assert interval_status(rep, 15)["status"] == "single-replica-deviation"
+    assert len(rep["divergent_intervals"]) == 1
+    assert rep["divergent_intervals"][0]["replica_id"] == "R-ACQ"
+    assert rep["ever_failed"] is True
+
+
+def test_conflict_with_incomplete_plan_stays_inconclusive(client):
+    mid = sealed_manifest(client, "M-JCPLAN")
+    plan = get_plan(client, mid)
+    assert create_joint(client, mid).status_code == 201
+    inspect_and_bind(client, mid, plan, replica_id="R-ACQ",
+                     inspection_id="I-R-ACQ",
+                     readings=make_readings(plan["planned_intervals"],
+                                            corrupt={(15, 17)}))
+    inspect_and_bind(client, mid, plan, replica_id="R-CPY",
+                     inspection_id="I-R-CPY")
+    # R-ARC skipped one planned interval
+    inspect_and_bind(client, mid, plan, replica_id="R-ARC",
+                     inspection_id="I-R-ARC-PART",
+                     readings=make_readings(plan["planned_intervals"],
+                                            skip={(31, 33)}))
+    rep = get_joint(client, mid)
+    assert rep["result"] == "inconclusive"
+    codes = [f["code"] for f in rep["findings"]]
+    assert "JOINT_INTERVAL_MISSING" in codes
+    assert "JOINT_DIGEST_CONFLICT" in codes
+    assert interval_status(rep, 15)["status"] == "single-replica-deviation"
+    assert interval_status(rep, 31)["status"] == "missing-read"
+    assert len(rep["divergent_intervals"]) == 1
+    assert rep["divergent_intervals"][0]["replica_id"] == "R-ACQ"
+    assert rep["ever_failed"] is True
+
+
+def test_conflict_with_duplicate_record_reference_stays_inconclusive(client):
+    mid = sealed_manifest(client, "M-JCDUP")
+    plan = get_plan(client, mid)
+    assert create_joint(client, mid).status_code == 201
+    inspect_and_bind(client, mid, plan, replica_id="R-ACQ",
+                     inspection_id="I-R-ACQ",
+                     readings=make_readings(plan["planned_intervals"],
+                                            corrupt={(15, 17)}))
+    inspect_and_bind(client, mid, plan, replica_id="R-CPY",
+                     inspection_id="I-R-CPY")
+    inspect_and_bind(client, mid, plan, replica_id="R-ARC",
+                     inspection_id="I-R-ARC")
+    # replaying R-ARC's record taints the run even though a deviation was
+    # proven on R-ACQ
+    rep = bind(client, mid, "J-1", "I-R-ARC").json()
+    assert rep["result"] == "inconclusive"
+    codes = [f["code"] for f in rep["findings"]]
+    assert "JOINT_INSPECTION_RECORD_REUSED" in codes
+    assert "JOINT_DIGEST_CONFLICT" in codes
+    assert interval_status(rep, 15)["status"] == "single-replica-deviation"
+    assert len(rep["divergent_intervals"]) == 1
+    assert rep["divergent_intervals"][0]["replica_id"] == "R-ACQ"
+    assert rep["ever_failed"] is True
+
+
 # ------------------------------------------------------- unit: evaluation ----
 def _stored_report(iid, rid, *, result="passed", findings=None, pkg="d" * 64):
     from app.schemas import InspectionReport
@@ -678,3 +789,19 @@ def test_evidence_package_mismatch_stays_inconclusive_unit():
     assert rep.result == "inconclusive"
     codes = [f.code for f in rep.findings]
     assert "JOINT_EVIDENCE_PACKAGE_MISMATCH" in codes
+
+
+def test_chain_broken_still_fails_despite_absent_replica_unit():
+    """Only digest deviation is demoted by insufficient joint evidence; a
+    proven broken replica chain remains a hard failure even when a
+    participant never submitted."""
+    broken = _stored_report(
+        "I-1", "R-ACQ", result="failed",
+        findings=[{"code": "INSPECTION_REPLICA_DIGEST_MISMATCH",
+                   "severity": "error", "message": "chain broken"}])
+    # R-CPY never binds -> absent (insufficient evidence) + chain broken
+    rep = _evaluate([broken])
+    assert rep.result == "failed"
+    codes = [f.code for f in rep.findings]
+    assert "JOINT_REPLICA_CHAIN_BROKEN" in codes
+    assert "JOINT_REPLICA_ABSENT" in codes

@@ -159,9 +159,11 @@ ID，永不覆盖失败结果。`GET /manifests/{id}/inspection-report` 汇总�
 （`JOINT_INSPECTION_RECORD_REUSED`，记录保留但不采信）、绑定的巡检与任务
 种子/比例/计划不符（`JOINT_PLAN_MISMATCH`）、绑定记录不属于参与副本
 （`JOINT_REPLICA_NOT_PARTICIPANT`）或证据包摘要不符
-（`JOINT_EVIDENCE_PACKAGE_MISMATCH`）。出现证实偏离
-（`JOINT_DIGEST_CONFLICT`）或绑定记录证明副本链断裂
-（`JOINT_REPLICA_CHAIN_BROKEN`）时判 `failed`。
+（`JOINT_EVIDENCE_PACKAGE_MISMATCH`）。判定优先级：绑定记录证明副本链断裂
+（`JOINT_REPLICA_CHAIN_BROKEN`）判 `failed`；证实偏离
+（`JOINT_DIGEST_CONFLICT`）只有在联合巡检证据完整时才判 `failed`——与
+缺席、越窗、区间不齐或重复引用任一条件并存时，任务保持 `inconclusive`，
+冲突 finding 与差异历史照常保留，证据不足的组合不被摘要偏离覆盖。
 
 `GET /manifests/{id}/joint-inspections/{joint_id}` 返回完整 JSON：逐区间
 联合判定与逐副本单元格（各自绑定原 `inspection_id`）、**逐副本覆盖**
