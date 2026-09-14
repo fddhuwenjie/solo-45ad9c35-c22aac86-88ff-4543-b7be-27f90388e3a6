@@ -23,14 +23,23 @@ from .db import (
     get_joint_inspection_by_id,
     get_manifest,
     get_media,
+    get_repair_execution,
+    get_repair_execution_by_id,
+    get_repair_plan,
+    get_repair_plan_by_id,
     insert_inspection,
     insert_joint_binding,
     insert_joint_inspection,
     insert_manifest,
+    insert_repair_execution,
+    insert_repair_plan,
     list_inspections,
     list_joint_bindings,
     list_joint_inspections,
     list_manifests,
+    list_repair_derived_replicas,
+    list_repair_executions,
+    list_repair_plans,
     mark_sealed,
     save_precheck,
     utcnow_iso,
@@ -52,6 +61,7 @@ from .inspection import (
 )
 from .joint import JointTaskContext, evaluate_joint_inspection
 from .recovery import analyze_recovery
+from .repair import evaluate_repair_execution, evaluate_repair_plan
 from .schemas import (
     DiffReport,
     EvaluationReport,
@@ -68,6 +78,13 @@ from .schemas import (
     ManifestCreated,
     MediaRecord,
     RecoveryState,
+    RepairDerivedReplica,
+    RepairExecutionCreate,
+    RepairExecutionReport,
+    RepairExecutionSummary,
+    RepairPlanCreate,
+    RepairPlanReport,
+    RepairPlanSummary,
     SealRejected,
     SealResult,
     Severity,
@@ -103,7 +120,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Split-Image Forensic Evidence Verification API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Verify segmented disk acquisitions: sector coverage by offset, "
         "chunk-order reconstruction, SHA-256/Merkle roots, write-protector "
@@ -116,7 +133,12 @@ app = FastAPI(
         "joint inspections freeze the participating replicas, one unified "
         "seed/ratio and a completion window, then compare every replica "
         "against the sealed baseline interval by interval to tell a single "
-        "rotting medium from a common multi-copy divergence."
+        "rotting medium from a common multi-copy divergence. Repair plans "
+        "freeze the joint task, the target replica and the donor priority, "
+        "draw replacement bytes only from replicas that matched the sealed "
+        "baseline on the same interval with complete evidence, and register "
+        "the repaired medium as a derived replica only after its recomputed "
+        "whole-disk SHA-256 and Merkle root match the sealed image."
     ),
     lifespan=lifespan,
 )
@@ -750,6 +772,229 @@ def bind_joint_submission(manifest_id: str, joint_id: str,
     insert_joint_binding(conn, joint_id, payload.inspection_id,
                          insp.replica_id, utcnow_iso())
     return _joint_report(conn, task_row)
+
+
+# ------------------------ replica interval repair (append-only) ----
+def _stored_repair_plan(row: sqlite3.Row) -> RepairPlanReport:
+    return RepairPlanReport.model_validate(json.loads(row["plan_json"]))
+
+
+def _stored_repair_execution(row: sqlite3.Row) -> RepairExecutionReport:
+    return RepairExecutionReport.model_validate(json.loads(row["report_json"]))
+
+
+def _repair_plan_summary(report: RepairPlanReport) -> RepairPlanSummary:
+    donors = sorted({i.donor_replica_id for i in report.repair_intervals
+                     if i.donor_replica_id})
+    return RepairPlanSummary(
+        plan_id=report.plan_id, joint_id=report.joint_id,
+        target_replica_id=report.target_replica_id,
+        executable=report.executable,
+        interval_count=len(report.repair_intervals),
+        repair_sectors=report.repair_sectors, donor_replica_ids=donors,
+        created_at=report.created_at)
+
+
+def _repair_execution_summary(report: RepairExecutionReport
+                              ) -> RepairExecutionSummary:
+    return RepairExecutionSummary(
+        execution_id=report.execution_id, plan_id=report.plan_id,
+        result=report.result, written_intervals=report.written_intervals,
+        written_sectors=report.written_sectors,
+        derived_replica_id=(report.derived_replica.replica_id
+                            if report.derived_replica else None),
+        created_at=report.created_at)
+
+
+@app.post("/manifests/{manifest_id}/repair-plans",
+          response_model=RepairPlanReport, status_code=201)
+def create_repair_plan(manifest_id: str, payload: RepairPlanCreate,
+                       conn: sqlite3.Connection = Depends(get_db)):
+    """Open a replica interval repair plan (append-only).
+
+    Freezes the sealed manifest, the joint inspection task, the target
+    replica and the donor priority order, then derives per frozen joint
+    plan interval the donor that may be read: only a replica whose own
+    bound inspection matched the sealed baseline on the SAME interval with
+    complete evidence. Adjacent intervals served by the same donor are
+    merged and donors are scheduled in priority order (one media mount per
+    donor). An unrecomputable baseline, missing donor reads, conflicting
+    donor digests, a broken source chain or an out-of-bounds target
+    interval leave the plan non-executable and name the gap. An existing
+    plan_id is never rewritten (409).
+    """
+    row, sealed_payload, sealed_report, package_digest_ = \
+        _sealed_context(conn, manifest_id)
+    if get_repair_plan_by_id(conn, payload.plan_id) is not None:
+        raise HTTPException(409, detail={
+            "code": "REPAIR_PLAN_DUPLICATE",
+            "message": f"repair plan {payload.plan_id} already exists; "
+                       "repair plans are append-only and a changed scope "
+                       "must use a new plan_id",
+            "plan_id": payload.plan_id})
+    task_row = get_joint_inspection(conn, manifest_id, payload.joint_id)
+    if task_row is None:
+        raise HTTPException(404, detail={
+            "code": "REPAIR_JOINT_UNKNOWN",
+            "message": f"joint inspection {payload.joint_id} not found for "
+                       f"manifest {manifest_id}; a repair plan must freeze "
+                       "an existing joint task",
+            "joint_id": payload.joint_id})
+    joint_report = _joint_report(conn, task_row)
+    participants = set(joint_report.replica_ids)
+    if payload.target_replica_id not in participants:
+        raise HTTPException(422, detail={
+            "code": "REPAIR_TARGET_NOT_PARTICIPANT",
+            "message": "the repair target must be a participating replica "
+                       "of the frozen joint task",
+            "target_replica_id": payload.target_replica_id,
+            "joint_replica_ids": joint_report.replica_ids})
+    unknown = [d for d in payload.donor_priority if d not in participants]
+    if unknown:
+        raise HTTPException(422, detail={
+            "code": "REPAIR_DONOR_NOT_PARTICIPANT",
+            "message": "donor candidates must be participating replicas of "
+                       "the frozen joint task",
+            "unknown_donor_ids": unknown,
+            "joint_replica_ids": joint_report.replica_ids})
+    geom = sealed_payload.media.geometry
+    report = evaluate_repair_plan(
+        plan_id=payload.plan_id, joint_report=joint_report,
+        target_replica_id=payload.target_replica_id,
+        donor_priority=payload.donor_priority,
+        requested_intervals=payload.intervals,
+        total_sectors=int(geom.total_sectors),
+        evidence_package_digest=package_digest_,
+        image_sha256=joint_report.image_sha256,
+        merkle_root=joint_report.merkle_root,
+        created_at=utcnow_iso())
+    insert_repair_plan(conn, report)
+    return report
+
+
+@app.get("/manifests/{manifest_id}/repair-plans",
+         response_model=list[RepairPlanSummary])
+def list_manifest_repair_plans(manifest_id: str,
+                               conn: sqlite3.Connection = Depends(get_db)):
+    if get_manifest(conn, manifest_id) is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    return [_repair_plan_summary(_stored_repair_plan(r))
+            for r in list_repair_plans(conn, manifest_id)]
+
+
+@app.get("/manifests/{manifest_id}/repair-plans/{plan_id}",
+         response_model=RepairPlanReport)
+def read_repair_plan(manifest_id: str, plan_id: str,
+                     conn: sqlite3.Connection = Depends(get_db)):
+    """The frozen JSON repair package: per-interval donor decisions with
+    the selection rationale, merged segments, the media-swap schedule, the
+    bound original inspection records and the self digest."""
+    row = get_repair_plan(conn, manifest_id, plan_id)
+    if row is None:
+        raise HTTPException(404, f"repair plan {plan_id} not found for "
+                                 f"manifest {manifest_id}")
+    return _stored_repair_plan(row)
+
+
+@app.post("/manifests/{manifest_id}/repair-plans/{plan_id}/executions",
+          response_model=RepairExecutionReport, status_code=201)
+def create_repair_execution(manifest_id: str, plan_id: str,
+                            payload: RepairExecutionCreate,
+                            conn: sqlite3.Connection = Depends(get_db)):
+    """Submit one repair execution against a frozen plan (append-only).
+
+    Every planned interval must be recorded exactly once: the donor read
+    digest must equal the baseline digest frozen into the plan, the write
+    digest must equal the read digest, and device errors are stored per
+    interval. When every interval is written, the recomputed whole-disk
+    SHA-256 and Merkle root of the repaired target must equal the sealed
+    image roots — only then is the new derived replica with its handover
+    events registered. A failed execution is stored and registers nothing;
+    an existing execution_id is never overwritten (409).
+    """
+    plan_row = get_repair_plan(conn, manifest_id, plan_id)
+    if plan_row is None:
+        raise HTTPException(404, f"repair plan {plan_id} not found for "
+                                 f"manifest {manifest_id}")
+    plan = _stored_repair_plan(plan_row)
+    if not plan.executable:
+        raise HTTPException(409, detail={
+            "code": "REPAIR_PLAN_NOT_EXECUTABLE",
+            "message": "the repair plan has blocking gaps and is not "
+                       "executable; open a new plan that resolves them",
+            "plan_id": plan_id,
+            "gaps": [f.model_dump(mode="json") for f in plan.findings
+                     if f.severity == Severity.error]})
+    if get_repair_execution_by_id(conn, payload.execution_id) is not None:
+        raise HTTPException(409, detail={
+            "code": "REPAIR_EXECUTION_DUPLICATE",
+            "message": f"repair execution {payload.execution_id} already "
+                       "exists; execution records are append-only and a "
+                       "re-run must use a new execution_id",
+            "execution_id": payload.execution_id})
+    derived_id = payload.derived_replica.replica_id
+    foreign = [e.event_id for e in payload.custody_events
+               if e.replica_id != derived_id]
+    if foreign:
+        raise HTTPException(422, detail={
+            "code": "REPAIR_CUSTODY_REPLICA_MISMATCH",
+            "message": "every handover event must reference the derived "
+                       f"replica {derived_id} being registered",
+            "event_ids": foreign})
+    event_ids = [e.event_id for e in payload.custody_events]
+    if len(set(event_ids)) != len(event_ids):
+        raise HTTPException(422, detail={
+            "code": "REPAIR_CUSTODY_EVENT_DUPLICATE",
+            "message": "handover event ids must be unique within one "
+                       "execution",
+            "event_ids": sorted(i for i in set(event_ids)
+                                if event_ids.count(i) > 1)})
+    row, sealed_payload, sealed_report, package_digest_ = \
+        _sealed_context(conn, manifest_id)
+    existing = {r.replica_id for r in sealed_payload.replicas}
+    existing |= {r["replica_id"]
+                 for r in list_repair_derived_replicas(conn, manifest_id)}
+    report = evaluate_repair_execution(
+        plan=plan, payload=payload, existing_replica_ids=existing,
+        created_at=utcnow_iso())
+    insert_repair_execution(conn, report)
+    return report
+
+
+@app.get("/manifests/{manifest_id}/repair-plans/{plan_id}/executions",
+         response_model=list[RepairExecutionSummary])
+def list_plan_executions(manifest_id: str, plan_id: str,
+                         conn: sqlite3.Connection = Depends(get_db)):
+    if get_repair_plan(conn, manifest_id, plan_id) is None:
+        raise HTTPException(404, f"repair plan {plan_id} not found for "
+                                 f"manifest {manifest_id}")
+    return [_repair_execution_summary(_stored_repair_execution(r))
+            for r in list_repair_executions(conn, plan_id)]
+
+
+@app.get("/manifests/{manifest_id}/repair-plans/{plan_id}/executions/{execution_id}",
+         response_model=RepairExecutionReport)
+def read_repair_execution(manifest_id: str, plan_id: str, execution_id: str,
+                          conn: sqlite3.Connection = Depends(get_db)):
+    row = get_repair_execution(conn, manifest_id, plan_id, execution_id)
+    if row is None:
+        raise HTTPException(404, f"repair execution {execution_id} not found "
+                                 f"for plan {plan_id} of manifest "
+                                 f"{manifest_id}")
+    return _stored_repair_execution(row)
+
+
+@app.get("/manifests/{manifest_id}/repair-replicas",
+         response_model=list[RepairDerivedReplica])
+def list_manifest_repair_replicas(manifest_id: str,
+                                  conn: sqlite3.Connection = Depends(get_db)):
+    """Derived replicas registered by completed repair executions, with
+    their handover events (append-only; the sealed manifest itself is
+    never modified)."""
+    if get_manifest(conn, manifest_id) is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    return [RepairDerivedReplica.model_validate(json.loads(r["record_json"]))
+            for r in list_repair_derived_replicas(conn, manifest_id)]
 
 
 @app.get("/media/{media_id}", response_model=MediaRecord)

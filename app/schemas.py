@@ -778,6 +778,305 @@ class JointInspectionSummary(ForensicModel):
     created_at: datetime
 
 
+# ------------------------------------------- replica interval repair ----
+# A joint inspection localizes the sectors where one replica deviates from
+# the sealed baseline, but the archivist still has to choose where the
+# replacement bytes come from — and a co-deviating replica used as a donor
+# propagates the error into every newly written copy. A repair plan freezes
+# the sealed manifest, the joint inspection task, the target replica and the
+# donor priority order, then allows data only from replicas whose own bound
+# inspection read the SAME interval, matched the sealed baseline and whose
+# inspection evidence is complete. Adjacent intervals served by the same
+# donor are merged and the donors are scheduled in priority order so the
+# operator swaps media as few times as possible. Plans, executions and
+# failure records are append-only.
+
+
+class RepairPlanCreate(ForensicModel):
+    """Open a replica interval repair plan on a sealed manifest."""
+
+    plan_id: str = Field(min_length=1,
+                         description="Unique id; repair plans are append-only "
+                                     "and an existing id is never rewritten")
+    joint_id: str = Field(min_length=1,
+                          description="Joint inspection task whose frozen "
+                                      "cross-replica evidence the plan is "
+                                      "derived from")
+    target_replica_id: str = Field(min_length=1,
+                                   description="Deviating replica to repair")
+    donor_priority: list[str] = Field(
+        min_length=1,
+        description="Donor candidates in priority order; only a replica that "
+                    "matched the sealed baseline on the same interval with "
+                    "complete inspection evidence may serve")
+    intervals: Optional[list[SectorInterval]] = Field(
+        None,
+        description="Explicit intervals to repair (each must be one of the "
+                    "frozen joint plan intervals); defaults to every interval "
+                    "where the target provably deviates")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "RepairPlanCreate":
+        if any(not d or not d.strip() for d in self.donor_priority):
+            raise ValueError("donor_priority must not contain empty identifiers")
+        if len(set(self.donor_priority)) != len(self.donor_priority):
+            raise ValueError("donor_priority must not contain duplicates")
+        if self.target_replica_id in self.donor_priority:
+            raise ValueError("the target replica cannot be its own donor")
+        for iv in self.intervals or []:
+            if iv.start_sector < 0:
+                raise ValueError("interval start_sector must be >= 0")
+            if iv.end_sector <= iv.start_sector:
+                raise ValueError("interval end_sector must be greater than "
+                                 "start_sector")
+        return self
+
+
+class RepairDonorRejection(ForensicModel):
+    """Why one donor candidate could not serve one interval."""
+
+    replica_id: str
+    inspection_id: Optional[str] = None
+    reason: Literal["co-deviating", "read-missing", "baseline-unverifiable",
+                    "source-chain-broken", "evidence-incomplete",
+                    "lower-priority"]
+    detail: Optional[str] = None
+
+
+class RepairIntervalPlan(ForensicModel):
+    """Per-interval repair decision frozen into the plan."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    status: Literal["ready", "blocked"]
+    expected_sha256: Optional[str] = Field(
+        None, description="Sealed baseline digest the donor bytes must hash to")
+    target_inspection_id: Optional[str] = None
+    target_actual_sha256: Optional[str] = Field(
+        None, description="Deviating digest observed on the target replica")
+    donor_replica_id: Optional[str] = None
+    donor_inspection_id: Optional[str] = None
+    donor_priority_rank: Optional[int] = Field(
+        None, description="1-based rank of the chosen donor in donor_priority")
+    rationale: Optional[str] = Field(
+        None, description="Human-readable donor selection rationale")
+    rejected_donors: list[RepairDonorRejection] = Field(default_factory=list)
+    gap_code: Optional[str] = Field(
+        None, description="Blocking gap code when status=blocked")
+
+
+class RepairSourceBinding(ForensicModel):
+    """Binding from the repair package to an original inspection record."""
+
+    replica_id: str
+    role: Literal["target", "donor"]
+    inspection_id: Optional[str] = None
+
+
+class RepairSegment(ForensicModel):
+    """Adjacent intervals served by the same donor, merged for one read pass."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    donor_replica_id: str
+    intervals: list[SectorInterval] = Field(default_factory=list)
+
+
+class RepairMediaStep(ForensicModel):
+    """One media mount in the frozen swap order (donor priority order)."""
+
+    mount_order: int
+    donor_replica_id: str
+    donor_inspection_id: Optional[str] = None
+    segments: list[RepairSegment] = Field(default_factory=list)
+    sectors: int = 0
+
+
+class RepairPlanReport(ForensicModel):
+    """Full JSON repair package: binds the original inspection records and
+    the donor selection rationale, and carries a self digest."""
+
+    plan_id: str
+    manifest_id: str
+    media_id: str
+    joint_id: str
+    target_replica_id: str
+    donor_priority: list[str]
+    executable: bool
+    repair_intervals: list[RepairIntervalPlan] = Field(default_factory=list)
+    repair_sectors: int = 0
+    segments: list[RepairSegment] = Field(default_factory=list)
+    media_schedule: list[RepairMediaStep] = Field(default_factory=list)
+    source_inspections: list[RepairSourceBinding] = Field(default_factory=list)
+    findings: list[Finding] = Field(default_factory=list)
+    evidence_package_digest: Optional[str] = None
+    image_sha256: Optional[str] = None
+    merkle_root: Optional[str] = None
+    repair_package_digest: Optional[str] = None
+    created_at: datetime
+
+
+class RepairPlanSummary(ForensicModel):
+    plan_id: str
+    joint_id: str
+    target_replica_id: str
+    executable: bool
+    interval_count: int
+    repair_sectors: int
+    donor_replica_ids: list[str]
+    created_at: datetime
+
+
+class RepairExecutionEntry(ForensicModel):
+    """Per-interval execution record: what was read from the donor and what
+    was written to the target, or the device error that prevented it."""
+
+    start_sector: int = Field(ge=0)
+    end_sector: int = Field(ge=0, description="exclusive")
+    donor_replica_id: Optional[str] = Field(
+        None, description="Self-declared donor medium; checked against the "
+                          "frozen plan")
+    read_sha256: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="SHA-256 of the bytes read from the donor")
+    read_error: Optional[str] = Field(
+        None, min_length=1,
+        description="Tool-reported device error while reading the donor")
+    write_sha256: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="SHA-256 of the bytes written to the target")
+    write_error: Optional[str] = Field(
+        None, min_length=1,
+        description="Tool-reported device error while writing the target")
+    read_at: Optional[datetime] = None
+    written_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "RepairExecutionEntry":
+        if self.end_sector <= self.start_sector:
+            raise ValueError("end_sector must be greater than start_sector")
+        if (self.read_sha256 is None) == (self.read_error is None):
+            raise ValueError("an entry must carry exactly one of read_sha256 "
+                             "(bytes read) or read_error (read failed)")
+        if self.read_sha256 is not None:
+            if (self.write_sha256 is None) == (self.write_error is None):
+                raise ValueError("a successful read must be followed by "
+                                 "exactly one of write_sha256 / write_error")
+        elif self.write_sha256 is not None:
+            raise ValueError("nothing was read from the donor; no bytes can "
+                             "have been written")
+        return self
+
+
+class DerivedReplicaInput(ForensicModel):
+    """Registration block for the repaired medium (registered only when the
+    execution completes and the final roots verify)."""
+
+    replica_id: str = Field(min_length=1)
+    storage_location: Optional[str] = None
+    custodian: Optional[str] = None
+    note: Optional[str] = None
+
+
+class RepairExecutionCreate(ForensicModel):
+    """Submit one repair execution against a frozen, executable plan."""
+
+    execution_id: str = Field(min_length=1,
+                              description="Unique id; execution records are "
+                                          "append-only and an existing id is "
+                                          "never overwritten")
+    device: InspectionDevice
+    entries: list[RepairExecutionEntry] = Field(
+        default_factory=list,
+        description="One record per planned repair interval")
+    final_sha256: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="Recomputed whole-disk SHA-256 of the repaired target")
+    final_merkle_root: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="Recomputed Merkle root of the repaired target")
+    derived_replica: DerivedReplicaInput = Field(
+        description="Replica registration requested when the execution "
+                    "completes and the final roots verify")
+    custody_events: list[CustodyEvent] = Field(
+        default_factory=list,
+        description="Handover events registered together with the derived "
+                    "replica; every event must reference its replica_id")
+    note: Optional[str] = None
+
+
+class RepairExecutionEntryResult(ForensicModel):
+    """Verified per-interval outcome of one execution."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    donor_replica_id: Optional[str] = None
+    expected_sha256: Optional[str] = None
+    status: Literal["written", "read-failed", "read-mismatch", "write-failed",
+                    "write-mismatch", "donor-mismatch", "missing",
+                    "out-of-plan", "duplicate"]
+    read_sha256: Optional[str] = None
+    read_error: Optional[str] = None
+    write_sha256: Optional[str] = None
+    write_error: Optional[str] = None
+    read_at: Optional[datetime] = None
+    written_at: Optional[datetime] = None
+
+
+class RepairDerivedReplica(ForensicModel):
+    """The repaired medium, registered as a new derived replica of the sealed
+    manifest together with its handover events."""
+
+    replica_id: str
+    manifest_id: str
+    plan_id: str
+    execution_id: str
+    parent_replica_id: str
+    sha256: str
+    merkle_root: Optional[str] = None
+    storage_location: Optional[str] = None
+    custodian: Optional[str] = None
+    custody_events: list[CustodyEvent] = Field(default_factory=list)
+    registered_at: datetime
+
+
+class RepairExecutionReport(ForensicModel):
+    """Full JSON report of one repair execution, bound to the frozen plan."""
+
+    execution_id: str
+    plan_id: str
+    manifest_id: str
+    media_id: str
+    target_replica_id: str
+    result: Literal["completed", "failed"]
+    device: InspectionDevice
+    entries: list[RepairExecutionEntryResult] = Field(default_factory=list)
+    planned_intervals: list[SectorInterval] = Field(default_factory=list)
+    written_intervals: int = 0
+    written_sectors: int = 0
+    final_sha256: Optional[str] = None
+    final_merkle_root: Optional[str] = None
+    expected_image_sha256: Optional[str] = None
+    expected_merkle_root: Optional[str] = None
+    final_verified: bool = False
+    derived_replica: Optional[RepairDerivedReplica] = None
+    findings: list[Finding] = Field(default_factory=list)
+    evidence_package_digest: Optional[str] = None
+    repair_package_digest: Optional[str] = None
+    created_at: datetime
+
+
+class RepairExecutionSummary(ForensicModel):
+    execution_id: str
+    plan_id: str
+    result: str
+    written_intervals: int
+    written_sectors: int
+    derived_replica_id: Optional[str] = None
+    created_at: datetime
+
+
 class FieldChange(ForensicModel):
     field: str
     left: Any = None

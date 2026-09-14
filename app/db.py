@@ -175,6 +175,56 @@ CREATE INDEX IF NOT EXISTS idx_joint_inspections_manifest
     ON joint_inspections(manifest_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_joint_bindings_joint
     ON joint_inspection_bindings(joint_id, binding_id);
+
+-- Replica interval repair plans are append-only: a plan freezes the sealed
+-- manifest, the joint inspection task, the target replica, the donor
+-- priority and the evaluated donor decisions (including blocking gaps);
+-- rows are never updated or deleted.
+CREATE TABLE IF NOT EXISTS repair_plans (
+    plan_id               TEXT PRIMARY KEY,
+    manifest_id           TEXT NOT NULL REFERENCES manifests(manifest_id),
+    joint_id              TEXT NOT NULL REFERENCES joint_inspections(joint_id),
+    media_id              TEXT NOT NULL,
+    target_replica_id     TEXT NOT NULL,
+    donor_priority_json   TEXT NOT NULL,
+    plan_json             TEXT NOT NULL,
+    executable            INTEGER NOT NULL,
+    evidence_package_digest TEXT,
+    created_at            TEXT NOT NULL
+);
+
+-- Repair executions (and their failures) are append-only: every execution
+-- attempt inserts a new row keyed by execution_id; rows are never updated
+-- or deleted, so a failed repair can never be overwritten by a re-run.
+CREATE TABLE IF NOT EXISTS repair_executions (
+    execution_id TEXT PRIMARY KEY,
+    plan_id      TEXT NOT NULL REFERENCES repair_plans(plan_id),
+    manifest_id  TEXT NOT NULL REFERENCES manifests(manifest_id),
+    result       TEXT NOT NULL CHECK (result IN ('completed','failed')),
+    report_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+-- The repaired medium of a fully verified execution is registered as a new
+-- derived replica of the sealed manifest (the sealed manifest itself stays
+-- read-only), together with its handover events inside record_json.
+CREATE TABLE IF NOT EXISTS repair_derived_replicas (
+    manifest_id       TEXT NOT NULL REFERENCES manifests(manifest_id),
+    replica_id        TEXT NOT NULL,
+    execution_id      TEXT NOT NULL REFERENCES repair_executions(execution_id),
+    plan_id           TEXT NOT NULL REFERENCES repair_plans(plan_id),
+    parent_replica_id TEXT NOT NULL,
+    sha256            TEXT NOT NULL,
+    merkle_root       TEXT,
+    record_json       TEXT NOT NULL,
+    registered_at     TEXT NOT NULL,
+    PRIMARY KEY (manifest_id, replica_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repair_plans_manifest
+    ON repair_plans(manifest_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_repair_executions_plan
+    ON repair_executions(plan_id, created_at);
 """
 
 
@@ -474,6 +524,106 @@ def list_joint_bindings(conn: sqlite3.Connection,
     return list(conn.execute(
         "SELECT * FROM joint_inspection_bindings WHERE joint_id=? "
         "ORDER BY binding_id", (joint_id,)))
+
+
+# -------------------------------------------------- repair plans (append-only)
+def insert_repair_plan(conn: sqlite3.Connection, report: Any) -> None:
+    """Append one repair plan. ``report`` is a RepairPlanReport; the fully
+    evaluated plan (donor decisions, merged segments, media schedule, gaps
+    and the self digest) is frozen into plan_json and never re-derived."""
+    conn.execute(
+        """INSERT INTO repair_plans (plan_id, manifest_id, joint_id, media_id,
+                                     target_replica_id, donor_priority_json,
+                                     plan_json, executable,
+                                     evidence_package_digest, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (report.plan_id, report.manifest_id, report.joint_id, report.media_id,
+         report.target_replica_id, canonical_json(report.donor_priority),
+         canonical_json(report.model_dump(mode="json")), int(report.executable),
+         report.evidence_package_digest, report.created_at.isoformat()))
+
+
+def get_repair_plan(conn: sqlite3.Connection, manifest_id: str,
+                    plan_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM repair_plans WHERE manifest_id=? AND plan_id=?",
+        (manifest_id, plan_id)).fetchone()
+
+
+def get_repair_plan_by_id(conn: sqlite3.Connection,
+                          plan_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM repair_plans WHERE plan_id=?",
+                        (plan_id,)).fetchone()
+
+
+def list_repair_plans(conn: sqlite3.Connection,
+                      manifest_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM repair_plans WHERE manifest_id=? "
+        "ORDER BY created_at, plan_id", (manifest_id,)))
+
+
+# --------------------------------------------- repair executions (append-only)
+def insert_repair_execution(conn: sqlite3.Connection, report: Any) -> None:
+    """Append one repair execution; when it completed, atomically register
+    the derived replica it produced. A registration failure must never leave
+    an execution row that claims completion without its replica."""
+    report_json = canonical_json(report.model_dump(mode="json"))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """INSERT INTO repair_executions (execution_id, plan_id,
+                                              manifest_id, result, report_json,
+                                              created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (report.execution_id, report.plan_id, report.manifest_id,
+             report.result, report_json, report.created_at.isoformat()))
+        if report.derived_replica is not None:
+            d = report.derived_replica
+            conn.execute(
+                """INSERT INTO repair_derived_replicas
+                       (manifest_id, replica_id, execution_id, plan_id,
+                        parent_replica_id, sha256, merkle_root, record_json,
+                        registered_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (d.manifest_id, d.replica_id, d.execution_id, d.plan_id,
+                 d.parent_replica_id, d.sha256, d.merkle_root,
+                 canonical_json(d.model_dump(mode="json")),
+                 d.registered_at.isoformat()))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def get_repair_execution(conn: sqlite3.Connection, manifest_id: str,
+                         plan_id: str,
+                         execution_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM repair_executions "
+        "WHERE manifest_id=? AND plan_id=? AND execution_id=?",
+        (manifest_id, plan_id, execution_id)).fetchone()
+
+
+def get_repair_execution_by_id(conn: sqlite3.Connection,
+                               execution_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM repair_executions WHERE execution_id=?",
+        (execution_id,)).fetchone()
+
+
+def list_repair_executions(conn: sqlite3.Connection,
+                           plan_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM repair_executions WHERE plan_id=? "
+        "ORDER BY created_at, execution_id", (plan_id,)))
+
+
+def list_repair_derived_replicas(conn: sqlite3.Connection,
+                                 manifest_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM repair_derived_replicas WHERE manifest_id=? "
+        "ORDER BY registered_at, replica_id", (manifest_id,)))
 
 
 def dependency_db() -> Any:
