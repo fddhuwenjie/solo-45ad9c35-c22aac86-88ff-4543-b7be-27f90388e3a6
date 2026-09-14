@@ -453,8 +453,9 @@ def evaluate_repair_execution(*, plan: RepairPlanReport,
     must equal the read digest, and finally the recomputed whole-disk
     SHA-256 and Merkle root of the repaired target must equal the sealed
     image roots. The handover must also be documented: at least one custody
-    event, and every event digest equal to the verified derived-replica
-    digest. Only then is the new derived replica with its handover events
+    event, and every event must carry digest_before, digest_after and
+    expected_digest, each equal to the verified derived-replica digest.
+    Only then is the new derived replica with its handover events
     registered; any failure is stored and nothing is registered.
     """
     media_id = plan.media_id
@@ -612,11 +613,12 @@ def evaluate_repair_execution(*, plan: RepairPlanReport,
                   replica_ids=[rid])
         # A completing execution registers the repaired medium TOGETHER WITH
         # its handover events: at least one event must be on record, and
-        # every event digest must equal the verified whole-disk SHA-256 of
+        # every event must actually carry digest_before, digest_after and
+        # expected_digest, each equal to the verified whole-disk SHA-256 of
         # the derived replica (whose Merkle root was verified against the
-        # sealed image above). An empty handover or a digest that disagrees
-        # with the verified replica keeps the execution failed and registers
-        # nothing.
+        # sealed image above). An empty handover, a missing/empty digest
+        # field or a digest that disagrees with the verified replica keeps
+        # the execution failed and registers nothing.
         if not payload.custody_events:
             error("REPAIR_CUSTODY_EVENTS_MISSING",
                   "a completing execution must register at least one "
@@ -624,11 +626,26 @@ def evaluate_repair_execution(*, plan: RepairPlanReport,
                   "custody_events list cannot document the handover",
                   replica_ids=[rid])
         else:
-            mismatched = [
-                e.event_id for e in payload.custody_events
-                if any(d != payload.final_sha256
-                       for d in (e.digest_before, e.digest_after,
-                                 e.expected_digest) if d)]
+            digest_fields = ("digest_before", "digest_after",
+                             "expected_digest")
+            missing: dict[str, list[str]] = {}
+            mismatched: list[str] = []
+            for e in payload.custody_events:
+                absent = [f for f in digest_fields if not getattr(e, f)]
+                if absent:
+                    missing[e.event_id] = absent
+                elif any(getattr(e, f) != payload.final_sha256
+                         for f in digest_fields):
+                    mismatched.append(e.event_id)
+            if missing:
+                error("REPAIR_CUSTODY_DIGEST_MISSING",
+                      "every handover event must carry digest_before, "
+                      "digest_after and expected_digest; the listed events "
+                      "declare no value for the listed fields, so the "
+                      "handover cannot be chained to the verified replica",
+                      replica_ids=[rid],
+                      detail={"events": missing,
+                              "derived_sha256": payload.final_sha256})
             if mismatched:
                 error("REPAIR_CUSTODY_DIGEST_MISMATCH",
                       "every handover event digest must equal the verified "

@@ -274,6 +274,82 @@ def test_custody_digest_mismatch_stays_failed(client):
         ("EX-3", "failed"), ("EX-4", "failed")]
 
 
+def test_custody_digests_missing_stay_failed(client):
+    """Regression: events whose digest fields are null or empty must not
+    complete — all-missing, partially-missing and empty-string variants.
+    An event without digest values carries nothing that could be chained
+    to the verified replica, so it must not sneak past the gate."""
+    mid = executable_plan(client, "M-RGATE-NULL")
+    plan_json = get_repair_plan(client, mid)
+    good = plan_json["image_sha256"]
+    all_fields = ["digest_before", "digest_after", "expected_digest"]
+
+    # (a) every digest field null on every event
+    r = execute(client, mid, execution_id="EX-1",
+                custody=repair_custody("R-ARC-FIX1", None))
+    rep = r.json()
+    assert rep["result"] == "failed"
+    assert "REPAIR_CUSTODY_DIGEST_MISSING" in codes(rep)
+    miss = next(f for f in rep["findings"]
+                if f["code"] == "REPAIR_CUSTODY_DIGEST_MISSING")
+    assert miss["replica_ids"] == ["R-ARC-FIX1"]
+    assert miss["detail"]["events"] == {
+        "E-R-ARC-FIX1-CPY": all_fields, "E-R-ARC-FIX1-VRF": all_fields}
+    assert miss["detail"]["derived_sha256"] == good
+    assert rep["derived_replica"] is None
+
+    # (b) partially missing: digest_before null on event 0,
+    #     expected_digest an empty string on event 1 (normalized to null)
+    r = execute(client, mid, execution_id="EX-2",
+                custody=repair_custody("R-ARC-FIX1", good,
+                                       **{"0__digest_before": None,
+                                          "1__expected_digest": ""}))
+    rep = r.json()
+    assert rep["result"] == "failed"
+    miss = next(f for f in rep["findings"]
+                if f["code"] == "REPAIR_CUSTODY_DIGEST_MISSING")
+    assert miss["detail"]["events"] == {
+        "E-R-ARC-FIX1-CPY": ["digest_before"],
+        "E-R-ARC-FIX1-VRF": ["expected_digest"]}
+    assert rep["derived_replica"] is None
+
+    # (c) every digest field an empty string (normalized to null)
+    r = execute(client, mid, execution_id="EX-3",
+                custody=repair_custody("R-ARC-FIX1", ""))
+    rep = r.json()
+    assert rep["result"] == "failed"
+    miss = next(f for f in rep["findings"]
+                if f["code"] == "REPAIR_CUSTODY_DIGEST_MISSING")
+    assert miss["detail"]["events"] == {
+        "E-R-ARC-FIX1-CPY": all_fields, "E-R-ARC-FIX1-VRF": all_fields}
+    assert rep["derived_replica"] is None
+
+    # (d) one event missing a field, the other mismatched: both findings
+    r = execute(client, mid, execution_id="EX-4",
+                custody=repair_custody("R-ARC-FIX1", good,
+                                       **{"0__digest_after": None,
+                                          "1__digest_after": "0" * 64}))
+    rep = r.json()
+    assert rep["result"] == "failed"
+    assert "REPAIR_CUSTODY_DIGEST_MISSING" in codes(rep)
+    assert "REPAIR_CUSTODY_DIGEST_MISMATCH" in codes(rep)
+    miss = next(f for f in rep["findings"]
+                if f["code"] == "REPAIR_CUSTODY_DIGEST_MISSING")
+    assert miss["detail"]["events"] == {"E-R-ARC-FIX1-CPY": ["digest_after"]}
+    mism = next(f for f in rep["findings"]
+                if f["code"] == "REPAIR_CUSTODY_DIGEST_MISMATCH")
+    assert mism["detail"]["event_ids"] == ["E-R-ARC-FIX1-VRF"]
+    assert rep["derived_replica"] is None
+
+    # nothing was ever registered; every failure stayed on record
+    assert repair_replicas(client, mid) == []
+    listed = client.get(
+        f"/manifests/{mid}/repair-plans/RP-1/executions").json()
+    assert [(e["execution_id"], e["result"]) for e in listed] == [
+        ("EX-1", "failed"), ("EX-2", "failed"),
+        ("EX-3", "failed"), ("EX-4", "failed")]
+
+
 def test_consistent_custody_after_failures_completes(client):
     """Failure records are append-only: after an empty and a mismatching
     handover fail, a corrected execution under a new id completes and
