@@ -372,16 +372,26 @@ def test_precheck_endpoint_returns_findings_without_sealing(client):
     assert any(f["code"] == "CHUNK_DIGEST_MISMATCH" for f in findings)
 
 
-def test_without_inline_content_warning_only_and_merkle_still_computed(client):
+def test_without_inline_content_or_files_is_hard_rejected(client):
+    """Weak path 1: no content_b64 and no readable stored_path must error,
+    never warn: every effective chunk digest and the image hash must recompute."""
     payload = build_payload(media_id="M-NOINLINE", with_content=False,
-                            expected_total=False, replicas="acquired")
-    # replica digest cannot be anchored without total hash/content -> only warnings,
-    # but merkle + coverage still make it sealable
+                            expected_total=False, replicas="full")
     created = post_manifest(client, payload).json()
-    assert created["report"]["merkle_root"]
-    assert created["report"]["reconstructed_sha256"] is None
-    assert created["report"]["sealable"] is True
-    assert seal(client, created["manifest_id"]).status_code == 200
+    report = created["report"]
+    assert report["merkle_root"]  # declared-digest Merkle still computed
+    assert report["reconstructed_sha256"] is None
+    assert report["all_chunk_digests_verified"] is False
+    emitted = {f["code"] for f in report["findings"]
+               if f["severity"] == "error"}
+    assert "CHUNK_CONTENT_UNAVAILABLE" in emitted
+    assert "IMAGE_HASH_NOT_RECOMPUTABLE" in emitted
+    assert report["sealable"] is False
+    r = seal(client, created["manifest_id"])
+    assert r.status_code == 409
+    blocker_codes = {f["code"] for f in r.json()["detail"]["blocking_findings"]}
+    assert "CHUNK_CONTENT_UNAVAILABLE" in blocker_codes
+    assert "IMAGE_HASH_NOT_RECOMPUTABLE" in blocker_codes
 
 
 def test_unknown_parent_and_cross_media_parent_rejected(client):

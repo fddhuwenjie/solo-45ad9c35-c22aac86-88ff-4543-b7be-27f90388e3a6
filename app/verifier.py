@@ -6,16 +6,18 @@ Only error findings prevent sealing; warnings preserve the audit trail.
 """
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from typing import Optional
 
-from .hashing import decode_b64_strict, linear_sha256, merkle_root
+from .chains import analyze_replica_custody
+from .content import ContentResolver, FilesystemContentResolver
+from .hashing import merkle_root
 from .schemas import (
+    ChunkContentVerification,
     ChunkInput,
-    CustodyEvent,
     EvaluationReport,
     Overlap,
-    ReplicaInput,
     SectorInterval,
     Severity,
 )
@@ -25,7 +27,16 @@ def _keep_first_same_id(group: list[ChunkInput]) -> ChunkInput:
     return sorted(group, key=lambda c: c.chunk_id)[0]
 
 
-def evaluate(payload) -> EvaluationReport:  # noqa: C901 - explicit rule sequence
+def evaluate(payload,
+             resolver: Optional[ContentResolver] = None) -> EvaluationReport:
+    """Evaluate a manifest payload.
+
+    ``resolver`` supplies actual chunk bytes (inline base64 or registered file
+    path). The default resolver reads inline content and any ``stored_path``
+    under the process evidence roots.
+    """
+    if resolver is None:
+        resolver = FilesystemContentResolver(())
     media = payload.media
     geom = media.geometry
     report = EvaluationReport(media_id=media.media_id,
@@ -86,7 +97,6 @@ def evaluate(payload) -> EvaluationReport:  # noqa: C901 - explicit rule sequenc
     chunks: list[ChunkInput] = payload.chunks
     chunk_ids: set[str] = set()
     by_id: dict[str, ChunkInput] = {}
-    decoded: dict[str, bytes] = {}
 
     for c in chunks:
         if c.chunk_id in chunk_ids:
@@ -122,30 +132,6 @@ def evaluate(payload) -> EvaluationReport:  # noqa: C901 - explicit rule sequenc
                          chunk_ids=[c.chunk_id],
                          start_sector=c.offset // geom.sector_size,
                          end_sector=(end + geom.sector_size - 1) // geom.sector_size)
-
-        if c.content_b64 is not None:
-            try:
-                data = decode_b64_strict(c.content_b64)
-            except Exception:
-                report.error("CHUNK_CONTENT_BAD_BASE64",
-                             f"chunk {c.chunk_id} inline content is not valid base64",
-                             chunk_ids=[c.chunk_id])
-            else:
-                if len(data) != c.length:
-                    report.error("CHUNK_CONTENT_LENGTH_MISMATCH",
-                                 f"chunk {c.chunk_id} content is {len(data)} bytes, "
-                                 f"declared length {c.length}",
-                                 chunk_ids=[c.chunk_id],
-                                 detail={"declared": c.length, "actual": len(data)})
-                else:
-                    decoded[c.chunk_id] = data
-                    actual = linear_sha256([data])
-                    if actual != c.sha256:
-                        report.error("CHUNK_DIGEST_MISMATCH",
-                                     f"chunk {c.chunk_id} SHA-256 does not match its "
-                                     f"content",
-                                     chunk_ids=[c.chunk_id],
-                                     detail={"declared": c.sha256, "actual": actual})
 
     # correction_of must reference a real chunk
     for c in chunks:
@@ -262,23 +248,113 @@ def evaluate(payload) -> EvaluationReport:  # noqa: C901 - explicit rule sequenc
                          detail={"offset_order": actual_order,
                                  "index_order": index_order})
 
-    # ------------------------------------------------ Merkle + linear hash --
+    # ---- actual content verification (inline base64 or registered files) --
+    # Effective chunks are streamed exactly once in reconstructed offset
+    # order: each read feeds both the chunk leaf hasher and the whole-image
+    # hasher. Superseded/deduplicated chunks are inspected without the image
+    # hasher and only produce warnings. Every effective chunk must be located,
+    # length-checked and hash-checked; otherwise neither per-chunk digests nor
+    # the whole-image hash can be re-derived and sealing is impossible.
+    effective_ids = {c.chunk_id for c in effective}
+    content_rows: dict[str, ChunkContentVerification] = {}
+    image_hasher = hashlib.sha256()
+
+    def _content_failure_message(c: ChunkInput, code: str) -> str:
+        return {
+            "CHUNK_CONTENT_UNAVAILABLE":
+                f"chunk {c.chunk_id}: no inline content and no registered "
+                f"stored_path; digest cannot be recomputed",
+            "CHUNK_FILE_UNREADABLE":
+                f"chunk {c.chunk_id}: registered file {c.stored_path} cannot "
+                f"be read; digest cannot be recomputed",
+            "CHUNK_FILE_OUTSIDE_ROOT":
+                f"chunk {c.chunk_id}: stored_path {c.stored_path} escapes the "
+                f"configured evidence root",
+            "CHUNK_CONTENT_BAD_BASE64":
+                f"chunk {c.chunk_id}: inline content is not valid base64",
+        }.get(code, f"chunk {c.chunk_id}: content unavailable ({code})")
+
+    def _inspect_chunk(c: ChunkInput, effective_chunk: bool) -> None:
+        result = (resolver.inspect(c, image_hasher) if effective_chunk
+                  else resolver.inspect(c))
+        row = ChunkContentVerification(
+            chunk_id=c.chunk_id, source=result.source,
+            readable=result.readable,
+            stored_path=result.registered_path,
+            length=result.length, sha256=result.sha256,
+            declared_sha256=c.sha256, digest_verified=False)
+        content_rows[c.chunk_id] = row
+
+        if not result.readable:
+            code = result.error_code or "CHUNK_CONTENT_UNAVAILABLE"
+            message = _content_failure_message(c, code)
+            if effective_chunk:
+                report.error(code, message, chunk_ids=[c.chunk_id],
+                             detail=result.error_detail)
+            else:
+                report.warn(code + "_SUPERSEDED",
+                            message + " (chunk superseded; not part of the image)",
+                            chunk_ids=[c.chunk_id], detail=result.error_detail)
+            return
+
+        if result.length != c.length:
+            message = (f"chunk {c.chunk_id}: actual content is {result.length} "
+                       f"bytes but manifest declares {c.length}")
+            if effective_chunk:
+                report.error("CHUNK_CONTENT_LENGTH_MISMATCH", message,
+                             chunk_ids=[c.chunk_id],
+                             detail={"declared": c.length,
+                                     "actual": result.length,
+                                     "source": result.source})
+            else:
+                report.warn("CHUNK_CONTENT_LENGTH_MISMATCH_SUPERSEDED",
+                            message + " (chunk superseded)",
+                            chunk_ids=[c.chunk_id])
+            return
+
+        row.digest_verified = result.sha256 == c.sha256
+        if not row.digest_verified:
+            message = (f"chunk {c.chunk_id}: recomputed SHA-256 from "
+                       f"{result.source} content conflicts with the manifest")
+            if effective_chunk:
+                report.error("CHUNK_DIGEST_MISMATCH", message,
+                             chunk_ids=[c.chunk_id],
+                             detail={"declared": c.sha256,
+                                     "actual": result.sha256,
+                                     "source": result.source,
+                                     "stored_path": result.registered_path})
+            else:
+                report.warn("CHUNK_DIGEST_MISMATCH_SUPERSEDED",
+                            message + " (chunk superseded)",
+                            chunk_ids=[c.chunk_id])
+
+    # 1) effective chunks in reconstructed offset order -> single streaming pass
+    for c in effective:
+        _inspect_chunk(c, True)
+    # 2) superseded / deduplicated chunks -> warnings only, no image hashing
+    for c in chunks:
+        if c.chunk_id not in effective_ids:
+            _inspect_chunk(c, False)
+
+    report.chunk_content = [content_rows[cid] for cid in sorted(content_rows)]
+    effective_verified = sum(
+        1 for cid in effective_ids if content_rows[cid].digest_verified)
+    report.all_chunk_digests_verified = (
+        bool(effective) and effective_verified == len(effective))
+
+    # --------- Merkle root (declared leaf digests in reconstructed order) ----
     report.merkle_root = merkle_root([c.sha256 for c in effective])
 
-    if effective:
-        present = [c for c in effective if c.chunk_id in decoded]
-        if len(present) == len(effective):
-            report.reconstructed_sha256 = linear_sha256(
-                [decoded[c.chunk_id] for c in effective])
-        elif present:
-            report.warn("TOTAL_HASH_PARTIAL",
-                        f"only {len(present)}/{len(effective)} chunks carry inline "
-                        f"content; linear hash cannot be recomputed")
-        elif payload.expected_total_sha256:
-            report.warn("TOTAL_HASH_NOT_RECOMPUTABLE",
-                        "total hash declared but no chunk content available; "
-                        "register content-bearing replicas/custody digests to "
-                        "corroborate it")
+    # ------- whole-image linear hash from the same single streaming pass -----
+    if report.all_chunk_digests_verified:
+        report.reconstructed_sha256 = image_hasher.hexdigest()
+    else:
+        report.error(
+            "IMAGE_HASH_NOT_RECOMPUTABLE",
+            "whole-image SHA-256 cannot be recomputed: one or more effective "
+            "chunks are missing, unreadable or digest-conflicting",
+            detail={"effective_chunks": len(effective),
+                    "verified": effective_verified})
 
     if report.reconstructed_sha256 and payload.expected_total_sha256:
         if report.reconstructed_sha256 != payload.expected_total_sha256:
@@ -328,133 +404,33 @@ def evaluate(payload) -> EvaluationReport:  # noqa: C901 - explicit rule sequenc
     elif not effective:
         report.complete_coverage = True
 
-    # ------------------------------------------------------------ replicas ---
-    replica_ids: set[str] = set()
-    by_replica: dict[str, ReplicaInput] = {}
-    acquired: list[ReplicaInput] = []
-    for r in payload.replicas:
-        if r.replica_id in replica_ids:
-            report.error("REPLICA_DUPLICATE",
-                         f"replica {r.replica_id} declared more than once",
-                         replica_ids=[r.replica_id])
-        replica_ids.add(r.replica_id)
-        by_replica[r.replica_id] = r
-        if r.role == "acquired":
-            acquired.append(r)
-
-    for r in payload.replicas:
-        if r.role == "acquired":
-            if not r.session_id or r.session_id not in session_ids:
-                report.error("REPLICA_SESSION_UNKNOWN",
-                             f"acquired replica {r.replica_id} is not bound to a "
-                             f"known acquisition session",
-                             replica_ids=[r.replica_id],
-                             session_id=r.session_id)
+    # ---------------- replicas + minimum custody-chain integrity ------------
+    def _chain_emit(severity: str, code: str, message: str, **kw) -> None:
+        if severity == "error":
+            report.error(code, message, **kw)
         else:
-            if not r.parent_replica_id:
-                report.error("REPLICA_PARENT_MISSING",
-                             f"{r.role} replica {r.replica_id} has no parent replica",
-                             replica_ids=[r.replica_id])
-            elif r.parent_replica_id not in replica_ids:
-                report.error("REPLICA_PARENT_UNKNOWN",
-                             f"replica {r.replica_id} descends from unknown replica "
-                             f"{r.parent_replica_id}",
-                             replica_ids=[r.replica_id,
-                                          r.parent_replica_id])
-            else:
-                parent = by_replica[r.parent_replica_id]
-                if parent.sha256 != r.sha256:
-                    report.error(
-                        "REPLICA_COPY_DIGEST_MISMATCH",
-                        f"{r.role} replica {r.replica_id} digest differs from its "
-                        f"parent {parent.replica_id}",
-                        replica_ids=[parent.replica_id, r.replica_id],
-                        detail={"parent": parent.sha256, "child": r.sha256})
+            report.warn(code, message, **kw)
 
-    def _matches_image(digest: str) -> Optional[bool]:
-        if report.reconstructed_sha256 is not None:
-            return digest == report.reconstructed_sha256
-        if payload.expected_total_sha256:
-            return digest == payload.expected_total_sha256
-        return None
+    chain = analyze_replica_custody(
+        payload.replicas, payload.custody_events, session_ids,
+        image_digest=report.reconstructed_sha256,
+        expected_total_sha256=payload.expected_total_sha256 or None,
+        merkle_root=report.merkle_root,
+        media_id=media.media_id,
+        emit=_chain_emit)
+    report.replica_chain_proven = chain.proven
+    report.terminal_replica_ids = chain.terminal_replica_ids
+    report.provenance_path = chain.chain_path
 
-    for r in acquired:
-        ok = _matches_image(r.sha256)
-        if ok is False:
-            report.error(
-                "ACQUIRED_DIGEST_MISMATCH",
-                f"acquired replica {r.replica_id} digest does not match the "
-                f"reconstructed/declared image digest",
-                replica_ids=[r.replica_id],
-                detail={"replica": r.sha256,
-                        "expected": report.reconstructed_sha256
-                        or payload.expected_total_sha256})
-        if r.merkle_root and report.merkle_root and r.merkle_root != report.merkle_root:
-            report.error("REPLICA_MERKLE_MISMATCH",
-                         f"replica {r.replica_id} Merkle root disagrees with chunk "
-                         f"reconstruction",
-                         replica_ids=[r.replica_id],
-                         detail={"replica": r.merkle_root,
-                                 "computed": report.merkle_root})
-
-    if not acquired:
-        report.warn("REPLICA_NO_ACQUISITION",
-                    "no replica with role=acquired anchors the custody chain")
-
-    # ------------------------------------------------------ custody events --
-    event_ids: set[str] = set()
-    events_by_replica: dict[str, list[CustodyEvent]] = defaultdict(list)
-    for e in payload.custody_events:
-        if e.event_id in event_ids:
-            report.error("CUSTODY_EVENT_DUPLICATE",
-                         f"custody event {e.event_id} declared more than once",
-                         event_id=e.event_id)
-        event_ids.add(e.event_id)
-        if e.replica_id not in replica_ids:
-            report.error("CUSTODY_REPLICA_UNKNOWN",
-                         f"event {e.event_id} references unknown replica "
-                         f"{e.replica_id}",
-                         event_id=e.event_id, replica_ids=[e.replica_id])
-        else:
-            events_by_replica[e.replica_id].append(e)
-
-    for replica_id, evs in events_by_replica.items():
-        replica = by_replica[replica_id]
-        evs.sort(key=lambda x: (x.at, x.event_id))
-        prev_after: Optional[str] = None
-        for e in evs:
-            expected_before = prev_after if prev_after is not None else replica.sha256
-            if e.digest_before and e.digest_before != expected_before:
-                report.error(
-                    "CUSTODY_DIGEST_BREAK",
-                    f"event {e.event_id}: digest_before does not chain from the "
-                    f"replica/previous event",
-                    replica_ids=[replica_id], event_id=e.event_id,
-                    detail={"expected": expected_before,
-                            "actual": e.digest_before})
-            if e.digest_after and e.digest_after != replica.sha256:
-                report.error(
-                    "CUSTODY_DIGEST_AFTER_BREAK",
-                    f"event {e.event_id}: post-event digest differs from replica "
-                    f"digest (tampering or bad reseal)",
-                    replica_ids=[replica_id], event_id=e.event_id,
-                    detail={"expected": replica.sha256,
-                            "actual": e.digest_after})
-            if e.expected_digest and e.expected_digest != replica.sha256:
-                report.error(
-                    "CUSTODY_EXPECTED_MISMATCH",
-                    f"event {e.event_id}: expected/hand-over digest does not match "
-                    f"the replica",
-                    replica_ids=[replica_id], event_id=e.event_id,
-                    detail={"expected": replica.sha256,
-                            "declared": e.expected_digest})
-            prev_after = e.digest_after or expected_before
-
-    for r in payload.replicas:
-        if not events_by_replica.get(r.replica_id):
-            report.warn("CUSTODY_GAP",
-                        f"replica {r.replica_id} has no custody events",
-                        replica_ids=[r.replica_id])
+    # ------------------------------------------------------------- verdict ---
+    has_errors = any(f.severity == Severity.error for f in report.findings)
+    report.sealable = (not has_errors
+                       and report.complete_coverage
+                       and report.merkle_root is not None
+                       and report.all_chunk_digests_verified
+                       and report.reconstructed_sha256 is not None
+                       and report.replica_chain_proven)
+    return report
 
     # ------------------------------------------------------------- verdict ---
     has_errors = any(f.severity == Severity.error for f in report.findings)

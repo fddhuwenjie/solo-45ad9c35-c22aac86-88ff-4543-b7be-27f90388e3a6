@@ -85,6 +85,7 @@ def sessions(chunks_per_session=(2, 2)) -> list[dict[str, Any]]:
 def build_chunks(chunk_seq: Optional[list[int]] = None,
                  sessions_split=(2, 2),
                  with_content: bool = True,
+                 with_stored_path: bool = False,
                  overrides: Optional[dict[int, dict[str, Any]]] = None,
                  id_prefix: str = "C",
                  extra: Optional[list[dict[str, Any]]] = None
@@ -110,9 +111,10 @@ def build_chunks(chunk_seq: Optional[list[int]] = None,
             "offset": pos * length,
             "length": length,
             "sha256": chunk_sha(seq),
-            "stored_path": f"/evidence/part{pos+1:02d}.dd",
             "file_size": length,
         }
+        if with_stored_path:
+            row["stored_path"] = f"/evidence/part{pos+1:02d}.dd"
         if with_content:
             row["content_b64"] = base64.b64encode(chunk_bytes(seq)).decode()
         row.update(overrides.get(pos, {}))
@@ -124,23 +126,34 @@ def build_chunks(chunk_seq: Optional[list[int]] = None,
 
 def custody(replica_id: str, digest: str, *, acquired_by: str = "zhao.lei",
             seal: bool = True, transfer: bool = False,
-            break_after: bool = False) -> list[dict[str, Any]]:
-    events = [
-        {"event_id": f"E-{replica_id}-ACQ", "event_type": "acquired",
-         "replica_id": replica_id, "at": (T0 + timedelta(hours=3)).isoformat(),
-         "actor": acquired_by, "organization": "现场取证组",
-         "digest_after": digest},
-        {"event_id": f"E-{replica_id}-VRF", "event_type": "verified",
-         "replica_id": replica_id, "at": (T0 + timedelta(hours=3, minutes=10)).isoformat(),
-         "actor": acquired_by,
-         "digest_before": digest, "digest_after": digest,
-         "expected_digest": digest},
-    ]
+            break_after: bool = False, role: str = "acquired") -> list[dict[str, Any]]:
+    base = T0 + timedelta(hours=3)
+    if role == "acquired":
+        events = [
+            {"event_id": f"E-{replica_id}-ACQ", "event_type": "acquired",
+             "replica_id": replica_id, "at": base.isoformat(),
+             "actor": acquired_by, "organization": "现场取证组",
+             "digest_after": digest},
+            {"event_id": f"E-{replica_id}-VRF", "event_type": "verified",
+             "replica_id": replica_id,
+             "at": (base + timedelta(minutes=10)).isoformat(),
+             "actor": acquired_by,
+             "digest_before": digest, "digest_after": digest,
+             "expected_digest": digest},
+        ]
+    else:
+        events = [
+            {"event_id": f"E-{replica_id}-CPY", "event_type": "copied",
+             "replica_id": replica_id, "at": base.isoformat(),
+             "actor": "qian.wu", "organization": "证据管理室",
+             "digest_before": digest, "digest_after": digest,
+             "expected_digest": digest},
+        ]
     if seal:
         events.append(
             {"event_id": f"E-{replica_id}-SEL", "event_type": "sealed",
              "replica_id": replica_id,
-             "at": (T0 + timedelta(hours=3, minutes=20)).isoformat(),
+             "at": (base + timedelta(minutes=20)).isoformat(),
              "actor": "qian.wu", "organization": "证据管理室",
              "digest_before": digest,
              "digest_after": ("0" * 64 if break_after else digest),
@@ -170,6 +183,7 @@ def build_payload(*, media_id: str = "MEDIA-001",
                   change_kind: str = "initial",
                   parent: Optional[str] = None,
                   expected_total: bool = True,
+                  with_stored_path: bool = False,
                   id_prefix: str = "C") -> dict[str, Any]:
     """Assemble a full manifest submission. Returns a JSON-ready dict."""
     digest = replica_digest or total_sha(chunk_seq)
@@ -178,6 +192,7 @@ def build_payload(*, media_id: str = "MEDIA-001",
     if sessions_row == "default":
         sessions_row = sessions()
     chunks = build_chunks(chunk_seq=chunk_seq, with_content=with_content,
+                          with_stored_path=with_stored_path,
                           overrides=chunk_overrides, extra=extra_chunks,
                           id_prefix=id_prefix)
     rep_rows: list[dict[str, Any]] = []
@@ -200,7 +215,7 @@ def build_payload(*, media_id: str = "MEDIA-001",
                 "parent_replica_id": parent_id, "sha256": digest,
                 "storage_location": loc, "custodian": "qian.wu",
                 "created_at": (T0 + timedelta(hours=hours)).isoformat()})
-            events += custody(rid, digest, seal=True,
+            events += custody(rid, digest, seal=True, role="copy",
                               transfer=(rid == "R-ARC"))
     payload: dict[str, Any] = {
         "change_kind": change_kind,
@@ -236,6 +251,60 @@ def client(tmp_path):
     app.state.db_path = str(db_path)
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture()
+def evidence_root(tmp_path):
+    """Filesystem evidence root + a resolver pointed at it."""
+    from app.content import FilesystemContentResolver
+    from app.main import set_content_resolver
+
+    root = tmp_path / "evidence"
+    root.mkdir()
+    set_content_resolver(FilesystemContentResolver(str(root)))
+    yield root
+    set_content_resolver(None)
+
+
+def write_chunk_files(payload, root, *, chunk_seq=None, omit=(), corrupt=(),
+                      truncate=(), swap=()):
+    """Materialize each chunk's bytes at its stored_path under ``root``.
+
+    omit/corrupt/truncate/swap are sets of chunk positions (0-based):
+      omit      -> file is not written (CHUNK_FILE_UNREADABLE)
+      corrupt   -> different bytes but same declared length (digest conflict)
+      truncate  -> file shorter than declared length
+      swap      -> pairs in ``swap`` exchange files (silent permutation)
+    Returns mapping position -> absolute file path.
+    """
+    omit, corrupt, truncate = set(omit), set(corrupt), set(truncate)
+    rows = [c for c in payload["chunks"] if "content_b64" in c
+            or c.get("stored_path")]
+    paths: dict[int, str] = {}
+    seq = chunk_seq if chunk_seq is not None else list(range(len(rows)))
+    for pos, row in enumerate(rows):
+        length = row["length"]
+        if pos in corrupt:
+            data = b"\x99" * length
+        elif pos in truncate:
+            data = chunk_bytes(seq[pos])[: length // 2]
+        else:
+            data = chunk_bytes(seq[pos])
+        rel = f"media/{row['chunk_id']}.dd"
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if pos not in omit:
+            target.write_bytes(data)
+        row.pop("content_b64", None)
+        row["stored_path"] = rel
+        paths[pos] = str(target)
+    for a, b in swap:
+        pa, pb = root / f"media/{rows[a]['chunk_id']}.dd", \
+                 root / f"media/{rows[b]['chunk_id']}.dd"
+        da, db = pa.read_bytes(), pb.read_bytes()
+        pa.write_bytes(db)
+        pb.write_bytes(da)
+    return paths
 
 
 def post_manifest(client, payload):

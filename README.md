@@ -26,7 +26,10 @@
 | `MEDIA_PARAMETERS_CHANGED` | 同一介质的后续修订改变了首次登记的扇区参数（中途换源/参数漂移） |
 | `WRITE_BLOCKER_MISSING / _FAILED / _SELF_TEST_MISMATCH` | 缺写保校验、校验未通过、自检摘要不符 |
 | `CHUNK_MISALIGNED / _OUT_OF_RANGE / _EMPTY` | 偏移或长度不按扇区对齐、越过容量、零长 |
-| `CHUNK_DIGEST_MISMATCH / _CONTENT_LENGTH_MISMATCH / _CONTENT_BAD_BASE64` | 内联内容重算摘要与声明不符 |
+| `CHUNK_CONTENT_UNAVAILABLE / _FILE_UNREADABLE / _FILE_OUTSIDE_ROOT / _CONTENT_BAD_BASE64` | **硬门槛**：无内联内容也无登记路径、分块文件不可读、路径逃逸证据根、Base64 非法——每块摘要必须能从真实字节复算 |
+| `CHUNK_CONTENT_LENGTH_MISMATCH / CHUNK_DIGEST_MISMATCH` | **硬门槛**：登记文件实际长度或重算 SHA-256 与清单声明冲突（warning 仅用于已被纠错取代的块） |
+| `IMAGE_HASH_NOT_RECOMPUTABLE` | **硬门槛**：任一块无法核验时，整盘线性哈希不可重建；不再降级为 warning |
+| `TOTAL_HASH_MISMATCH` | 按偏移顺序拼接真实字节重算的整盘 SHA-256 与现场总哈希不一致（可抓出错序拼接） |
 | `CHUNK_DUPLICATE_RANGE`（warning） | 同区间同摘要的冗余块，自动去重保留其一 |
 | `CHUNK_DIGEST_CONFLICT` | 同区间摘要不同且没有合法 `correction_of` 纠错链 |
 | `CHUNK_CORRECTION_APPLIED`（warning） | 纠错块替换同区间旧块，旧块仍保留在清单中只读 |
@@ -34,9 +37,11 @@
 | `COVERAGE_GAP` | 未覆盖扇区区间（半开区间 `[start,end)`，可直接定位缺块） |
 | `INDEX_ORDER_MISMATCH / INDEX_DUPLICATE` | 声明序号顺序与按偏移重建的块序不一致 / 序号重复 |
 | `TOTAL_HASH_MISMATCH` | 线性重算的整盘 SHA-256 与现场总哈希不一致 |
-| `REPLICA_PARENT_UNKNOWN / _COPY_DIGEST_MISMATCH / REPLICA_NO_ACQUISITION` 等 | 副本链断裂、复制件与母本摘要不一致 |
-| `ACQUIRED_DIGEST_MISMATCH / REPLICA_MERKLE_MISMATCH` | 采集件摘要/Merkle 与重建结果不一致 |
-| `CUSTODY_DIGEST_BREAK / _AFTER_BREAK / _EXPECTED_MISMATCH / CUSTODY_GAP` | 交接前后摘要断链、封存/移交摘要与副本不一致（篡改或重封失败） |
+| `REPLICA_CHAIN_EMPTY / REPLICA_NO_ACQUISITION`（硬门槛） | 零副本，或缺 `acquired` 采集件锚定整条链 |
+| `REPLICA_PARENT_UNKNOWN / _PARENT_MISSING / _COPY_DIGEST_MISMATCH` | 副本链断裂、复制件与母本摘要不一致 |
+| `CUSTODY_CHAIN_EMPTY / CUSTODY_NO_EVENTS / CUSTODY_EVENT_MISSING / CUSTODY_TERMINAL_NOT_HANDED_OVER / REPLICA_CHAIN_UNPROVEN`（硬门槛） | 零交接事件、某副本无事件、缺 acquired/copied 必需事件、末端副本未同时 sealed+transferred、无法证明采集→复制→封存移交的连续性 |
+| `ACQUIRED_DIGEST_MISMATCH / REPLICA_MERKLE_MISMATCH` | 采集件摘要/Merkle 与按真实字节重建的结果不一致 |
+| `CUSTODY_DIGEST_BREAK / _AFTER_BREAK / _EXPECTED_MISMATCH` | 交接前后摘要断链、封存/移交摘要与副本不一致（篡改或重封失败） |
 
 所有 finding 都携带 `media_id`，并尽量带 `chunk_ids / session_id / replica_ids /
 event_id` 与扇区区间，便于直接定位介质、区间和事件。
@@ -50,9 +55,13 @@ event_id` 与扇区区间，便于直接定位介质、区间和事件。
   再与采集工具声明的 `index` 顺序比对。
 - **Merkle 树**：叶子为块 SHA-256（按重建顺序），内部节点
   `sha256(left_bytes || right_bytes)`；奇数节点直接上提。空树返回 `null`。
-- **线性总摘要**：当所有有效块都带内联内容时，
-  `sha256(concat(块字节, 按 ordered_chunk_ids))`，并与 `expected_total_sha256` 对比。
-  真实大文件场景内容不内联，仅给出 warning（Merkle 与覆盖仍可核）。
+- **线性总摘要（硬门槛）**：每块的真实字节优先取内联 `content_b64`，否则从登记的
+  `stored_path` 流式读取（1 MiB 分块，可处理大文件），逐块核对长度与 SHA-256；
+  全部通过后按 `ordered_chunk_ids` 顺序流式拼接重算整盘 SHA-256，并与
+  `expected_total_sha256` 对比。文件缺失、越权路径、截断、单块摘要冲突或总哈希不符，
+  均为 error 并拒绝封存（已被纠错取代的旧块不可读只记 warning）。证据根目录由
+  环境变量 `EVIDENCE_ROOTS`（冒号分隔，默认 `data/evidence`）限定，相对路径相对
+  根目录解析；根目录之外的路径一律拒绝。
 
 ## 版本与封存（只追加，不可变）
 
@@ -84,27 +93,49 @@ event_id` 与扇区区间，便于直接定位介质、区间和事件。
 
 交互式文档：服务启动后访问 `/docs`（Swagger）。
 
+### 副本/交接链最低完整性（硬门槛）
+
+预检、封存和证据包复算都要求记录能**证明**摘要连续性，否则拒绝封存、证据包 `valid=false`：
+
+1. 至少一个 `acquired` 副本且绑定真实采集会话，其摘要必须等于按字节重建的整盘摘要；
+2. 每个 `copy/archive` 必须声明父副本，且父子 SHA-256 完全一致；
+3. 每个副本至少有一个交接事件；采集件必须有 `acquired` 事件，每个复制件必须有
+   `copied` 事件；
+4. 链末端（无下游副本的 leaf）必须**同时**具备 `sealed` 与 `transferred` 事件；
+5. 每个事件的 `digest_before` 必须承接副本摘要或上一事件的 `digest_after`，
+   `digest_after`/`expected_digest` 必须恒等于副本摘要。
+6. 存在一条 acquired → … → 末端的完整可达路径（`provenance_path` 写入报告）。
+
+零副本、零事件、缺必需事件、末端未封存移交、摘要断链或路径不可达，分别报
+`REPLICA_CHAIN_EMPTY / CUSTODY_CHAIN_EMPTY / CUSTODY_EVENT_MISSING /
+CUSTODY_TERMINAL_NOT_HANDED_OVER / CUSTODY_DIGEST_*_BREAK / REPLICA_CHAIN_UNPROVEN`。
+
 ### 可复算证据包
 
 证据包包含：清单元信息（含 `payload_digest`）、**规范化提交原文**、
-计算结果（块序、Merkle 根及其算法说明、线性总摘要、覆盖/缺块/重叠）、
-全部 finding 与复算步骤说明；最后对"去掉 `evidence_package_digest` 的自身"
-做规范 JSON 序列化再求 SHA-256，得到包摘要。任意机器把 JSON 原样 POST 到
-`/evidence/recompute` 即可验证：`payload_digest_ok`、`merkle_root_ok`、
-`coverage_ok`、`total_hash_ok`、`evidence_package_digest_ok`。
+计算结果（块序、每块内容核验来源与结果、Merkle 根及其算法说明、线性总摘要、
+副本链 `provenance_path`、覆盖/缺块/重叠）、全部 finding 与复算步骤说明；
+最后对"去掉 `evidence_package_digest` 的自身"做规范 JSON 序列化再求 SHA-256，
+得到包摘要。任意机器把 JSON 原样 POST 到 `/evidence/recompute` 即可验证：
+`schema_ok`、`payload_digest_ok`、`chunk_content_ok`（逐块从内联内容或
+`stored_path` 重读复算）、`merkle_root_ok`、`coverage_ok`、`total_hash_ok`、
+`replica_custody_chain_ok`、`evidence_package_digest_ok`。
 
 ## 运行
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+# EVIDENCE_ROOTS 限定分块文件可读目录（冒号分隔，默认 data/evidence）
+EVIDENCE_ROOTS=/var/evidence:/mnt/raid/acquisitions \
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
 # 数据库默认在 data/evidence.db（SQLite WAL），首次启动自动建表
 ```
 
 测试：
 
 ```bash
-pytest -q          # 26 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、证据包复算等
+pytest -q          # 43 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
+                   # 文件型分块读取/缺件/截断/错序拼接、零副本零事件、证据包复算等
 ```
 
 ### 请求示例（片段）
@@ -139,9 +170,11 @@ pytest -q          # 26 个用例：覆盖、重叠、错序、纠错、换盘�
 app/
   schemas.py    Pydantic 输入/输出模型与 finding、报告结构
   hashing.py    规范 JSON、SHA-256、线性摘要、Merkle 树
-  verifier.py   纯函数核验引擎（全部规则，可独立单测）
+  content.py    分块内容解析：内联 Base64 或证据根内 stored_path 流式读取
+  chains.py     副本/交接链最低完整性（引擎与证据包复算共用的纯函数）
+  verifier.py   核验引擎（全部规则，可独立单测）
   evidence.py   证据包构造、修订比较
   db.py         SQLite 建表、事务化修订写入、封存/预检持久化
   main.py       FastAPI 路由
-tests/          26 个端到端与单元测试（合成 32KiB 介质、两段断电采集）
+tests/          43 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块）
 ```

@@ -149,6 +149,17 @@ class SectorInterval(ForensicModel):
     end_sector: int  # exclusive
 
 
+class ChunkContentVerification(ForensicModel):
+    chunk_id: str
+    source: Literal["inline", "file", "none"]
+    readable: bool
+    stored_path: Optional[str] = None
+    length: Optional[int] = None
+    sha256: Optional[str] = None
+    declared_sha256: Optional[str] = None
+    digest_verified: bool = False
+
+
 class Overlap(ForensicModel):
     start_sector: int
     end_sector: int  # exclusive
@@ -163,9 +174,14 @@ class EvaluationReport(ForensicModel):
     covered_intervals: list[SectorInterval] = Field(default_factory=list)
     gaps: list[SectorInterval] = Field(default_factory=list)
     overlaps: list[Overlap] = Field(default_factory=list)
+    chunk_content: list[ChunkContentVerification] = Field(default_factory=list)
     covered_sectors: int = 0
     total_sectors: int = 0
     complete_coverage: bool = False
+    all_chunk_digests_verified: bool = False
+    replica_chain_proven: bool = False
+    terminal_replica_ids: list[str] = Field(default_factory=list)
+    provenance_path: list[str] = Field(default_factory=list)
     merkle_root: Optional[str] = None
     reconstructed_sha256: Optional[str] = None
     expected_total_sha256: Optional[str] = None

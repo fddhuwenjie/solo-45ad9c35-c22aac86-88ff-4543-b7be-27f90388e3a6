@@ -71,6 +71,11 @@ def build_evidence_package(row: sqlite3.Row,
             "reconstructed_sha256": report.reconstructed_sha256,
             "expected_total_sha256": report.expected_total_sha256,
             "total_hash_verified": report.total_hash_verified,
+            "all_chunk_digests_verified": report.all_chunk_digests_verified,
+            "chunk_content": [c.model_dump() for c in report.chunk_content],
+            "replica_chain_proven": report.replica_chain_proven,
+            "provenance_path": report.provenance_path,
+            "terminal_replica_ids": report.terminal_replica_ids,
             "coverage": {
                 "total_sectors": report.total_sectors,
                 "covered_sectors": report.covered_sectors,
@@ -88,14 +93,23 @@ def build_evidence_package(row: sqlite3.Row,
                               "separators=(',', ':'), ensure_ascii=False)",
             "linear_hash": "sha256(concatenation of chunk bytes in "
                            "ordered_chunk_ids order)",
+            "chunk_content": "each effective chunk's SHA-256 is recomputed "
+                             "from inline content_b64 or the registered "
+                             "stored_path and compared with its declared digest",
             "merkle": MERKLE_SPEC,
+            "replica_custody_chain": "acquired replica -> same-digest copies -> "
+                                     "terminal replica with sealed+transferred "
+                                     "events; every event's digest_before/"
+                                     "digest_after must equal the replica digest",
             "checks": [
                 "payload_digest == sha256(canonical_json(submission))",
+                "every effective chunk digest recomputes from actual bytes",
                 "merkle_root recomputed from ordered chunk sha256 leaves",
                 "coverage intervals equal full [0,total_sectors) without overlap",
                 "reconstructed_sha256 == expected_total_sha256 when present",
                 "replica digests chain acquisition -> copy -> archive",
                 "custody digest_before/digest_after chain per replica",
+                "a terminal replica records both sealed and transferred events",
             ],
         },
     }

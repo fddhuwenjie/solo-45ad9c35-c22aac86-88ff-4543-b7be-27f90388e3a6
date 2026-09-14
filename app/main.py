@@ -1,7 +1,9 @@
 """FastAPI application: manifest intake, precheck, sealing, diffs, evidence."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -10,6 +12,8 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
+from .chains import analyze_replica_custody
+from .content import ContentResolver, FilesystemContentResolver
 from .db import (
     get_db,
     get_manifest,
@@ -27,7 +31,7 @@ from .evidence import (
     payload_from_row,
     report_from_json,
 )
-from .hashing import digest_canonical, linear_sha256, merkle_root
+from .hashing import digest_canonical, merkle_root
 from .schemas import (
     DiffReport,
     EvaluationReport,
@@ -42,9 +46,29 @@ from .schemas import (
 from .verifier import evaluate
 
 
+def _evidence_roots() -> list[str]:
+    raw = os.environ.get("EVIDENCE_ROOTS", "data/evidence")
+    return [p for p in raw.split(os.pathsep) if p]
+
+
+_content_resolver: ContentResolver = FilesystemContentResolver(_evidence_roots())
+
+
+def set_content_resolver(resolver: Optional[ContentResolver]) -> None:
+    """Override the chunk-content resolver (used by tests / deployments)."""
+    global _content_resolver
+    _content_resolver = (resolver if resolver is not None
+                         else FilesystemContentResolver(_evidence_roots()))
+
+
+def get_content_resolver() -> ContentResolver:
+    return _content_resolver
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure(app.state.db_path)
+    set_content_resolver(FilesystemContentResolver(_evidence_roots()))
     yield
 
 
@@ -98,8 +122,10 @@ def _attach_lineage_findings(conn: sqlite3.Connection, payload: ManifestCreate,
 
 
 def _evaluate_with_lineage(conn: sqlite3.Connection,
-                           payload: ManifestCreate) -> EvaluationReport:
-    report = evaluate(payload)
+                           payload: ManifestCreate,
+                           resolver: Optional[ContentResolver] = None
+                           ) -> EvaluationReport:
+    report = evaluate(payload, resolver=resolver or _content_resolver)
     _attach_lineage_findings(conn, payload, report)
     return report
 
@@ -302,7 +328,14 @@ def compare_revisions(left: str = Query(..., description="manifest id (base)"),
 
 @app.post("/evidence/recompute")
 def recompute_evidence(body: dict[str, Any]):
-    """Recompute every digest inside an evidence package from its raw fields."""
+    """Recompute every digest inside an evidence package from its raw fields.
+
+    Hard gate (valid=false unless all pass): payload digest, per-chunk content
+    digest/length (inline content_b64 re-decoded, otherwise the registered
+    stored_path is re-read under the configured evidence roots), Merkle root,
+    full-coverage without overlap, linear whole-image hash against the scene
+    total hash when present, and the replica/custody minimum chain.
+    """
     declared_digest = body.get("evidence_package_digest")
     package_digest_ok = None
     if declared_digest:
@@ -310,24 +343,37 @@ def recompute_evidence(body: dict[str, Any]):
 
     pkg = body.get("package") or {}
     submission = body.get("submission") or {}
+    computed = body.get("computed") if isinstance(body.get("computed"), dict) else {}
     payload_digest_recomputed = digest_canonical(submission)
     payload_digest_ok = payload_digest_recomputed == pkg.get("payload_digest")
 
-    chunks = submission.get("chunks") or []
-    chunks_by_id = {c["chunk_id"]: c for c in chunks}
-    computed = body.get("computed") or {}
+    # Validate the raw submission against the same Pydantic contract; a malformed
+    # package can never be valid.
+    schema_ok = True
+    schema_errors: list[Any] = []
+    try:
+        payload = ManifestCreate.model_validate(submission)
+    except Exception as exc:  # ValidationError / ValueError
+        schema_ok = False
+        schema_errors = [str(exc)]
+        payload = None
+
     media = submission.get("media") or {}
     geom = media.get("geometry") or {}
     sector_size = int(geom.get("sector_size") or 0) or 1
     total_sectors = int(geom.get("total_sectors") or 0)
 
+    chunks = submission.get("chunks") or []
+    chunks_by_id = {c.get("chunk_id"): c for c in chunks
+                    if c.get("chunk_id") is not None}
+
     # Follow the reconstructed order stored in the package: corrections may have
     # superseded raw chunks that are still present in the submission.
-    ordered_ids = ((computed.get("ordered_chunk_ids") or [])
-                   if isinstance(computed, dict) else [])
+    ordered_ids = (computed.get("ordered_chunk_ids") or [])
     ordered = [chunks_by_id[cid] for cid in ordered_ids if cid in chunks_by_id]
     if not ordered:
-        ordered = sorted(chunks, key=lambda c: (int(c["offset"]), c["chunk_id"]))
+        ordered = sorted(chunks, key=lambda c: (int(c.get("offset", 0)),
+                                                c.get("chunk_id", "")))
 
     intervals = sorted(
         ((int(c["offset"]) // sector_size,
@@ -344,25 +390,79 @@ def recompute_evidence(body: dict[str, Any]):
                    and merged[0][0] == 0 and merged[-1][1] == total_sectors)
 
     merkle_recomputed = merkle_root([c["sha256"] for c in ordered])
-    computed = body.get("computed") or {}
-    merkle_ok = merkle_recomputed == computed.get("merkle_root")
+    merkle_ok = bool(ordered) and merkle_recomputed == computed.get("merkle_root")
 
+    # ---- hard per-chunk verification against actual bytes -----------------
+    chunk_checks: list[dict[str, Any]] = []
+    chunk_content_ok = bool(ordered)
     linear = None
     total_hash_ok = None
-    if all(c.get("content_b64") for c in ordered) and ordered:
-        import base64
-        linear = linear_sha256([base64.b64decode(c["content_b64"])
-                                for c in ordered])
-        expected = submission.get("expected_total_sha256")
-        if expected:
-            total_hash_ok = linear == expected
+    if payload is not None and ordered:
+        by_id = {c.chunk_id: c for c in payload.chunks}
+        effective_models = [by_id[c["chunk_id"]] for c in ordered
+                            if c["chunk_id"] in by_id]
+        verified = 0
+        image_hasher = hashlib.sha256()
+        for model in effective_models:
+            # single streaming read feeds both the leaf digest and the
+            # offset-order whole-image hasher
+            result = _content_resolver.inspect(model, image_hasher)
+            length_ok = result.readable and result.length == model.length
+            digest_ok = result.readable and result.sha256 == model.sha256
+            row_ok = length_ok and digest_ok
+            if row_ok:
+                verified += 1
+            chunk_checks.append({
+                "chunk_id": model.chunk_id, "source": result.source,
+                "readable": result.readable,
+                "stored_path": result.registered_path,
+                "length_ok": length_ok,
+                "digest_ok": digest_ok,
+                "error_code": result.error_code,
+            })
+        chunk_content_ok = verified == len(effective_models)
+        if chunk_content_ok:
+            linear = image_hasher.hexdigest()
+            expected = submission.get("expected_total_sha256")
+            if expected:
+                total_hash_ok = linear == expected
+
+    # ---- replica/custody minimum chain over recorded digests --------------
+    chain_ok = False
+    chain_detail: dict[str, Any] = {}
+    if payload is not None:
+        session_ids = {s.session_id for s in payload.sessions}
+        state = analyze_replica_custody(
+            payload.replicas, payload.custody_events, session_ids,
+            image_digest=linear,
+            expected_total_sha256=payload.expected_total_sha256 or None,
+            merkle_root=merkle_recomputed if merkle_ok else None)
+        chain_ok = state.proven
+        chain_detail = {"replica_ok": state.replica_ok,
+                        "custody_ok": state.custody_ok,
+                        "proven": state.proven,
+                        "provenance_path": state.chain_path,
+                        "terminal_replica_ids": state.terminal_replica_ids}
+
+        # recorded whole-image hash inside the package must match recomputation
+        recorded_linear = computed.get("reconstructed_sha256")
+        if recorded_linear is not None and linear is not None:
+            if recorded_linear != linear:
+                chunk_content_ok = False
+
+    recorded_chain_proven = computed.get("replica_chain_proven")
+    recorded_chain_ok = (recorded_chain_proven is True) if \
+        "replica_chain_proven" in computed else True
 
     checks = {
+        "schema_ok": schema_ok,
         "payload_digest_ok": payload_digest_ok,
+        "chunk_content_ok": chunk_content_ok,
         "merkle_root_ok": merkle_ok,
         "coverage_ok": coverage_ok,
         "overlap_detected": overlap_detected,
         "total_hash_ok": total_hash_ok,
+        "replica_custody_chain_ok": chain_ok and recorded_chain_ok,
         "evidence_package_digest_ok": package_digest_ok,
     }
     # overlap_detected is an informational negative indicator, not a pass flag.
@@ -374,6 +474,9 @@ def recompute_evidence(body: dict[str, Any]):
         "manifest_id": pkg.get("manifest_id"),
         "valid": valid,
         "checks": checks,
+        "chain": chain_detail,
+        "schema_errors": schema_errors,
+        "chunk_checks": chunk_checks,
         "recomputed": {
             "payload_digest": payload_digest_recomputed,
             "merkle_root": merkle_recomputed,
