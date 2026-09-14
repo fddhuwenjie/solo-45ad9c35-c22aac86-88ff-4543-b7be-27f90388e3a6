@@ -31,7 +31,8 @@ from .evidence import (
     payload_from_row,
     report_from_json,
 )
-from .hashing import digest_canonical, merkle_root
+from .hashing import canonical_json, digest_canonical, merkle_root
+from .recovery import analyze_recovery
 from .schemas import (
     DiffReport,
     EvaluationReport,
@@ -39,6 +40,7 @@ from .schemas import (
     ManifestCreate,
     ManifestCreated,
     MediaRecord,
+    RecoveryState,
     SealRejected,
     SealResult,
     Severity,
@@ -74,13 +76,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Split-Image Forensic Evidence Verification API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Verify segmented disk acquisitions: sector coverage by offset, "
         "chunk-order reconstruction, SHA-256/Merkle roots, write-protector "
-        "checks and replica/chain-of-custody digest continuity. Resumes, "
-        "target swaps and corrections can only create new revisions; sealed "
-        "manifests stay read-only."
+        "checks, bad-sector retry/fill provenance and replica/chain-of-custody "
+        "digest continuity. Resumes, target swaps and corrections can only "
+        "create new revisions; sealed manifests stay read-only."
     ),
     lifespan=lifespan,
 )
@@ -147,6 +149,18 @@ def _summary(row: sqlite3.Row) -> dict[str, Any]:
 def _validate_lineage(conn: sqlite3.Connection, payload: ManifestCreate) -> None:
     media_id = payload.media.media_id
     existing = list_manifests(conn, media_id)
+    # Manual acceptance of unrecovered sectors must be justified on record and
+    # can only be introduced by a derived revision, never by the initial one.
+    if payload.recovery_exceptions and payload.change_kind == "initial":
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "EXCEPTION_REVISION_REQUIRED",
+                    "message": "manual acceptance of unrecovered sectors "
+                               "requires a documented reason and a derived "
+                               "revision (resume/target-swap/correction); it "
+                               "cannot be registered on the initial manifest",
+                    "exception_ids": [e.exception_id
+                                      for e in payload.recovery_exceptions]})
     if payload.change_kind == "initial":
         if existing:
             raise HTTPException(
@@ -279,6 +293,22 @@ def manifest_findings(manifest_id: str, conn: sqlite3.Connection = Depends(get_d
         raise HTTPException(404, f"manifest {manifest_id} not found")
     report = report_from_json(row["seal_report_json"] or row["precheck_json"])
     return report.findings if report else []
+
+
+@app.get("/manifests/{manifest_id}/recovery",
+         response_model=RecoveryState)
+def manifest_recovery(manifest_id: str,
+                      conn: sqlite3.Connection = Depends(get_db)):
+    """Read-attempt log, final read/fill/unrecovered segments, exception
+    decisions and recovery rate from the same evaluation used by precheck,
+    diffs, the evidence package and recompute."""
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    report = report_from_json(row["seal_report_json"] or row["precheck_json"])
+    if report is None:
+        report = _evaluate_with_lineage(conn, payload_from_row(row))
+    return report.recovery
 
 
 @app.get("/manifests/{manifest_id}/evidence-package")
@@ -426,6 +456,7 @@ def recompute_evidence(body: dict[str, Any]):
                 "effective": feeds_image,
                 "length_ok": length_ok,
                 "digest_ok": digest_ok,
+                "actual_sha256": result.sha256,
                 "error_code": result.error_code,
             })
 
@@ -443,6 +474,85 @@ def recompute_evidence(body: dict[str, Any]):
                 total_hash_ok = linear == expected
         else:
             chunk_content_ok = False
+
+    # ---- bad-sector retry / fill provenance from the same raw records -----
+    # The attempt log, exception decisions and recovery rate stored in the
+    # package must be exactly what the raw submission recomputes to, and every
+    # fill declaration / successful-read digest must re-verify against bytes.
+    recovery_ok: Optional[bool] = None
+    recovery_detail: dict[str, Any] = {}
+    recovery_findings: list[dict[str, Any]] = []
+    recorded_recovery = computed.get("recovery") if isinstance(
+        computed.get("recovery"), dict) else None
+    if payload is not None:
+        eff_for_recovery: list[Any] = []
+        if ordered_ids:
+            by_id_rc = {c.chunk_id: c for c in payload.chunks}
+            eff_for_recovery = [by_id_rc[cid] for cid in ordered_ids
+                                if cid in by_id_rc]
+        else:
+            eff_for_recovery = sorted(payload.chunks,
+                                      key=lambda c: (c.offset, c.chunk_id))
+        content_rows_map = {
+            chk["chunk_id"]: type("_R", (), {
+                "sha256": chk.get("actual_sha256"),
+                "digest_verified": chk.get("digest_ok")})()
+            for chk in chunk_checks}
+
+        def _recovery_collect(severity, code, message, **kw):
+            recovery_findings.append({"severity": severity, "code": code,
+                                      "message": message, **kw})
+
+        recovery_state = analyze_recovery(
+            payload, eff_for_recovery, _content_resolver,
+            content_rows=content_rows_map, emit=_recovery_collect)
+        recomputed_recovery = recovery_state.model_dump(mode="json")
+
+        def _norm(d):
+            return json.loads(canonical_json(d)) if d is not None else None
+
+        rec_core = {
+            "provenance_mode": recomputed_recovery["provenance_mode"],
+            "segments": recomputed_recovery["segments"],
+            "exceptions": recomputed_recovery["exceptions"],
+            "freeze_policy": recomputed_recovery["freeze_policy"],
+            "freeze_ok": recomputed_recovery["freeze_ok"],
+            "read_sectors": recomputed_recovery["read_sectors"],
+            "filled_sectors": recomputed_recovery["filled_sectors"],
+            "unrecovered_sectors": recomputed_recovery["unrecovered_sectors"],
+            "accepted_sectors": recomputed_recovery["accepted_sectors"],
+            "recovered_sectors": recomputed_recovery["recovered_sectors"],
+            "recovery_rate": recomputed_recovery["recovery_rate"],
+            "fill_rate": recomputed_recovery["fill_rate"],
+            "unrecovered_rate": recomputed_recovery["unrecovered_rate"],
+            "attempts": recomputed_recovery["attempts"],
+        }
+        error_codes = {f["code"] for f in recovery_findings
+                       if f["severity"] == "error"}
+        segments_content_ok = all(
+            s.content_ok or (s.kind == "unrecovered"
+                             and s.exception_id is not None)
+            for s in recovery_state.segments)
+        recovery_detail = {
+            "recovery_rate": recovery_state.recovery_rate,
+            "fill_rate": recovery_state.fill_rate,
+            "read_sectors": recovery_state.read_sectors,
+            "filled_sectors": recovery_state.filled_sectors,
+            "unrecovered_sectors": recovery_state.unrecovered_sectors,
+            "accepted_sectors": recovery_state.accepted_sectors,
+            "freeze_ok": recovery_state.freeze_ok,
+            "error_codes": sorted(error_codes),
+        }
+        recomputation_clean = (not error_codes and segments_content_ok
+                               and recovery_state.freeze_ok)
+        if recorded_recovery is not None:
+            recorded_core = {k: recorded_recovery.get(k) for k in rec_core}
+            recovery_ok = (_norm(recorded_core) == _norm(rec_core)
+                           and recomputation_clean)
+        else:
+            # package produced before attempts existed: clean legacy analysis
+            recovery_ok = (recovery_state.provenance_mode
+                           == "legacy-content-only" and recomputation_clean)
 
     # ---- replica/custody minimum chain over recorded digests --------------
     chain_ok = False
@@ -479,6 +589,7 @@ def recompute_evidence(body: dict[str, Any]):
         "coverage_ok": coverage_ok,
         "overlap_detected": overlap_detected,
         "total_hash_ok": total_hash_ok,
+        "recovery_provenance_ok": recovery_ok,
         "replica_custody_chain_ok": chain_ok and recorded_chain_ok,
         "evidence_package_digest_ok": package_digest_ok,
     }
@@ -492,8 +603,11 @@ def recompute_evidence(body: dict[str, Any]):
         "valid": valid,
         "checks": checks,
         "chain": chain_detail,
+        "recovery": recovery_detail,
+        "recovery_findings": recovery_findings,
         "schema_errors": schema_errors,
-        "chunk_checks": chunk_checks,
+        "chunk_checks": [{k: v for k, v in c.items()
+                          if k != "actual_sha256"} for c in chunk_checks],
         "recomputed": {
             "payload_digest": payload_digest_recomputed,
             "merkle_root": merkle_recomputed,

@@ -85,6 +85,22 @@ def build_evidence_package(row: sqlite3.Row,
                 "gaps": [i.model_dump() for i in report.gaps],
                 "overlaps": [o.model_dump() for o in report.overlaps],
             },
+            "recovery": {
+                "provenance_mode": report.recovery.provenance_mode,
+                "attempts": [a.model_dump() for a in report.recovery.attempts],
+                "segments": [s.model_dump() for s in report.recovery.segments],
+                "exceptions": report.recovery.exceptions,
+                "freeze_policy": report.recovery.freeze_policy,
+                "freeze_ok": report.recovery.freeze_ok,
+                "read_sectors": report.recovery.read_sectors,
+                "filled_sectors": report.recovery.filled_sectors,
+                "unrecovered_sectors": report.recovery.unrecovered_sectors,
+                "accepted_sectors": report.recovery.accepted_sectors,
+                "recovered_sectors": report.recovery.recovered_sectors,
+                "recovery_rate": report.recovery.recovery_rate,
+                "fill_rate": report.recovery.fill_rate,
+                "unrecovered_rate": report.recovery.unrecovered_rate,
+            },
         },
         "findings": _sorted_findings(report),
         "sealable": report.sealable,
@@ -107,6 +123,15 @@ def build_evidence_package(row: sqlite3.Row,
                 "merkle_root recomputed from ordered chunk sha256 leaves",
                 "coverage intervals equal full [0,total_sectors) without overlap",
                 "reconstructed_sha256 == expected_total_sha256 when present",
+                "read attempts split overlapping ranges into atomic segments; "
+                "later successful reads supersede earlier failures while "
+                "failure records stay; final segments are labelled read/fill/"
+                "unrecovered and fill bytes/sparse holes match the image",
+                "successful read digests recompute from the bound chunks and "
+                "no two successful reads of the same range disagree",
+                "documented recovery exceptions only cover still-unrecovered "
+                "sectors and unrecovered-but-unaccepted sectors fit the frozen "
+                "policy; recovery/fill rates match",
                 "replica digests chain acquisition -> copy -> archive",
                 "custody digest_before/digest_after chain per replica",
                 "a terminal replica records both sealed and transferred events",
@@ -151,11 +176,24 @@ def diff_manifests(left_row: sqlite3.Row,
     lr, rr = _ids(left.replicas, "replica_id"), _ids(right.replicas, "replica_id")
     le, re = _ids(left.custody_events, "event_id"), _ids(right.custody_events,
                                                           "event_id")
+    la, ra = _ids(left.read_attempts, "attempt_id"), \
+        _ids(right.read_attempts, "attempt_id")
+    lx, rx = _ids(left.recovery_exceptions, "exception_id"), \
+        _ids(right.recovery_exceptions, "exception_id")
 
     chunk_digest_changed = sorted(cid for cid in lc.keys() & rc.keys()
                                   if lc[cid].sha256 != rc[cid].sha256
                                   or lc[cid].offset != rc[cid].offset
                                   or lc[cid].length != rc[cid].length)
+
+    def _attempt_signature(a):
+        return (a.session_id, a.chunk_id, a.start_sector, a.end_sector,
+                a.round, a.result, a.tool_error_code, a.actual_read_length,
+                a.fill_method, a.fill_value, a.sparse_hole, a.sha256)
+
+    attempts_changed = sorted(aid for aid in la.keys() & ra.keys()
+                              if _attempt_signature(la[aid])
+                              != _attempt_signature(ra[aid]))
 
     return DiffReport(
         left_manifest_id=left_row["manifest_id"],
@@ -176,4 +214,15 @@ def diff_manifests(left_row: sqlite3.Row,
         merkle_root_right=right_report.merkle_root,
         reconstructed_sha256_left=left_report.reconstructed_sha256,
         reconstructed_sha256_right=right_report.reconstructed_sha256,
+        attempts_added=sorted(ra.keys() - la.keys()),
+        attempts_removed=sorted(la.keys() - ra.keys()),
+        attempt_results_changed=attempts_changed,
+        exceptions_added=sorted(rx.keys() - lx.keys()),
+        exceptions_removed=sorted(lx.keys() - rx.keys()),
+        recovery_rate_left=left_report.recovery.recovery_rate,
+        recovery_rate_right=right_report.recovery.recovery_rate,
+        unrecovered_sectors_left=left_report.recovery.unrecovered_sectors,
+        unrecovered_sectors_right=right_report.recovery.unrecovered_sectors,
+        accepted_sectors_left=left_report.recovery.accepted_sectors,
+        accepted_sectors_right=right_report.recovery.accepted_sectors,
     )

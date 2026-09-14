@@ -89,8 +89,36 @@ CREATE TABLE IF NOT EXISTS custody_events (
     PRIMARY KEY (manifest_id, event_id)
 );
 
+CREATE TABLE IF NOT EXISTS read_attempts (
+    manifest_id TEXT NOT NULL REFERENCES manifests(manifest_id),
+    attempt_id  TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    chunk_id    TEXT NOT NULL,
+    start_sector INTEGER NOT NULL,
+    end_sector   INTEGER NOT NULL,
+    round        INTEGER NOT NULL,
+    result       TEXT NOT NULL,
+    actual_read_length INTEGER NOT NULL,
+    record_json  TEXT NOT NULL,
+    PRIMARY KEY (manifest_id, attempt_id)
+);
+
+CREATE TABLE IF NOT EXISTS recovery_exceptions (
+    manifest_id TEXT NOT NULL REFERENCES manifests(manifest_id),
+    exception_id TEXT NOT NULL,
+    start_sector INTEGER NOT NULL,
+    end_sector   INTEGER NOT NULL,
+    reason       TEXT NOT NULL,
+    record_json  TEXT NOT NULL,
+    PRIMARY KEY (manifest_id, exception_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_manifests_media ON manifests(media_id, revision);
 CREATE INDEX IF NOT EXISTS idx_chunks_offset ON chunks(manifest_id, offset);
+CREATE INDEX IF NOT EXISTS idx_attempts_chunk
+    ON read_attempts(manifest_id, chunk_id);
+CREATE INDEX IF NOT EXISTS idx_exceptions_range
+    ON recovery_exceptions(manifest_id, start_sector, end_sector);
 """
 
 
@@ -250,6 +278,26 @@ def _insert_children(conn: sqlite3.Connection, manifest_id: str,
                VALUES (?,?,?,?,?,?)""",
             (manifest_id, e.event_id, e.replica_id, e.event_type,
              e.at.isoformat(), e.digest_after))
+
+    for a in payload.read_attempts:
+        conn.execute(
+            """INSERT INTO read_attempts (manifest_id, attempt_id, session_id,
+                                          chunk_id, start_sector, end_sector,
+                                          round, result, actual_read_length,
+                                          record_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (manifest_id, a.attempt_id, a.session_id, a.chunk_id,
+             a.start_sector, a.end_sector, a.round, a.result,
+             a.actual_read_length, canonical_json(_dump(a))))
+
+    for ex in payload.recovery_exceptions:
+        conn.execute(
+            """INSERT INTO recovery_exceptions (manifest_id, exception_id,
+                                                start_sector, end_sector, reason,
+                                                record_json)
+               VALUES (?,?,?,?,?,?)""",
+            (manifest_id, ex.exception_id, ex.start_sector, ex.end_sector,
+             ex.reason, canonical_json(_dump(ex))))
 
 
 def save_precheck(conn: sqlite3.Connection, manifest_id: str, report_json: str) -> None:

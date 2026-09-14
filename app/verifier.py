@@ -13,6 +13,7 @@ from typing import Optional
 from .chains import analyze_replica_custody
 from .content import ContentResolver, FilesystemContentResolver
 from .hashing import merkle_root
+from .recovery import analyze_recovery
 from .schemas import (
     ChunkContentVerification,
     ChunkInput,
@@ -401,6 +402,23 @@ def evaluate(payload,
     elif not effective:
         report.complete_coverage = True
 
+    # ---------------- bad-sector retry / fill provenance -------------------
+    # Split overlapping read attempts into atomic sector slices, merge the
+    # retry rounds (later reads supersede earlier failures, failures stay on
+    # record), label every final segment read/fill/unrecovered, verify fill
+    # bytes/sparse holes against the actual chunk content, apply documented
+    # exception acceptances and enforce the frozen unrecovered-sector policy.
+    def _recovery_emit(severity: str, code: str, message: str, **kw) -> None:
+        if severity == "error":
+            report.error(code, message, **kw)
+        else:
+            report.warn(code, message, **kw)
+
+    recovery = analyze_recovery(
+        payload, effective, resolver,
+        content_rows=content_rows, emit=_recovery_emit)
+    report.recovery = recovery
+
     # ---------------- replicas + minimum custody-chain integrity ------------
     def _chain_emit(severity: str, code: str, message: str, **kw) -> None:
         if severity == "error":
@@ -420,8 +438,15 @@ def evaluate(payload,
     report.provenance_path = chain.chain_path
 
     # ------------------------------------------------------------- verdict ---
+    # content_ok is False for genuinely unrecovered segments; those stop
+    # mattering only when a documented exception explicitly accepts them
+    # (freeze_ok already enforces the policy on everything unaccepted).
+    recovery_ok = (recovery.freeze_ok and all(
+        s.content_ok or (s.kind == "unrecovered" and s.exception_id is not None)
+        for s in recovery.segments))
     has_errors = any(f.severity == Severity.error for f in report.findings)
     report.sealable = (not has_errors
+                       and recovery_ok
                        and report.complete_coverage
                        and report.merkle_root is not None
                        and report.all_chunk_digests_verified

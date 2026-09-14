@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 HEX64 = r"^[0-9a-f]{64}$"
 HEX64_OR_EMPTY = r"^(?:[0-9a-f]{64})?$"
@@ -65,6 +65,116 @@ class AcquisitionSession(ForensicModel):
     note: Optional[str] = None
 
 
+# --------------------------------------------------------- read attempts ----
+# Read attempts are submitted in acquisition order per session. A tool that
+# reads a range partially MUST split it into separate attempts for the sectors
+# it actually got and for the sectors it failed on; an attempt that claims a
+# range wider than its actual_read_length is rejected. Fill/sparse-hole
+# declarations are first-class provenance, never silently counted as reads.
+ReadResult = Literal["read", "error", "fill"]
+FillMethod = Literal["zero-pad", "pattern-pad", "sparse-hole"]
+
+
+class ReadAttemptInput(ForensicModel):
+    attempt_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    chunk_id: str = Field(min_length=1,
+                          description="Final chunk this attempt is bound to")
+    start_sector: int = Field(ge=0, description="Source medium sector (inclusive)")
+    end_sector: int = Field(ge=0, description="Source medium sector (exclusive)")
+    round: int = Field(ge=1, description="Retry round; non-decreasing per session")
+    result: ReadResult
+    tool_error_code: Optional[str] = Field(
+        None, min_length=1,
+        description="Tool-reported error (e.g. ECC/UNC/medium-error); required "
+                    "for result=error")
+    # Bytes actually transferred from the source. Must equal the sector span
+    # * sector_size for result=read and must be 0 for result=error/fill.
+    actual_read_length: int = Field(ge=0)
+    fill_method: Optional[FillMethod] = None
+    fill_value: Optional[int] = Field(None, ge=0, le=255)
+    sparse_hole: bool = False
+    sha256: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="Optional tool-reported digest of the successfully read bytes")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "ReadAttemptInput":
+        if self.end_sector <= self.start_sector:
+            raise ValueError("end_sector must be greater than start_sector")
+        if self.result == "read":
+            if self.fill_method is not None or self.fill_value is not None \
+                    or self.sparse_hole:
+                raise ValueError("a successful read must not carry fill "
+                                 "declarations")
+            if self.tool_error_code:
+                raise ValueError("a successful read must not carry a tool error "
+                                 "code")
+        elif self.result == "error":
+            if not self.tool_error_code:
+                raise ValueError("result=error requires tool_error_code")
+            if self.fill_method is not None or self.fill_value is not None \
+                    or self.sparse_hole:
+                raise ValueError("a failed attempt must not carry fill "
+                                 "declarations; declare the zero-fill/sparse "
+                                 "hole as a separate fill attempt")
+        elif self.result == "fill":
+            if not self.fill_method:
+                raise ValueError("result=fill requires fill_method")
+            if self.fill_method == "zero-pad" and self.fill_value not in (None, 0):
+                raise ValueError("zero-pad fill requires fill_value 0/omitted")
+            if self.fill_method in ("pattern-pad",) and self.fill_value is None:
+                raise ValueError("pattern-pad fill requires an explicit "
+                                 "fill_value")
+            if self.fill_method == "sparse-hole":
+                if self.fill_value is not None:
+                    raise ValueError("a sparse hole declares no byte value")
+                self.sparse_hole = True
+            if self.tool_error_code:
+                raise ValueError("a fill declaration must not carry a tool "
+                                 "error code")
+        return self
+
+
+class RecoveryExceptionInput(ForensicModel):
+    """Manual acceptance of sectors that could not be recovered."""
+
+    exception_id: str = Field(min_length=1)
+    start_sector: int = Field(ge=0)
+    end_sector: int = Field(ge=0)
+    reason: str = Field(min_length=1,
+                        description="Documented reason for accepting the gap")
+    accepted_by: str = Field(min_length=1)
+    accepted_at: datetime
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "RecoveryExceptionInput":
+        if self.end_sector <= self.start_sector:
+            raise ValueError("end_sector must be greater than start_sector")
+        return self
+
+
+class FreezePolicyInput(ForensicModel):
+    """Frozen tolerance for unrecovered source sectors at sealing time."""
+
+    max_unrecovered_sectors: Optional[int] = Field(
+        None, ge=0,
+        description="Absolute cap on unrecovered-but-unaccepted sectors")
+    max_unrecovered_ratio: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="Ratio cap on unrecovered-but-unaccepted sectors")
+
+    @model_validator(mode="after")
+    def _check_present(self) -> "FreezePolicyInput":
+        if (self.max_unrecovered_sectors is None
+                and self.max_unrecovered_ratio is None):
+            raise ValueError("freeze policy must set an absolute or ratio "
+                             "threshold")
+        return self
+
+
 class ChunkInput(ForensicModel):
     chunk_id: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
@@ -117,6 +227,18 @@ class ManifestCreate(ForensicModel):
     write_blocker: Optional[WriteBlockerCheck] = None
     sessions: list[AcquisitionSession] = Field(default_factory=list)
     chunks: list[ChunkInput] = Field(default_factory=list)
+    read_attempts: list[ReadAttemptInput] = Field(
+        default_factory=list,
+        description="Per-session, in-order read attempts (retries, errors and "
+                    "fills) bound to final chunks")
+    recovery_exceptions: list[RecoveryExceptionInput] = Field(
+        default_factory=list,
+        description="Manually accepted unrecovered ranges (derived revisions "
+                    "only; each must carry a reason)")
+    freeze_policy: Optional[FreezePolicyInput] = Field(
+        None,
+        description="Frozen tolerance for unrecovered sectors; defaults to "
+                    "zero tolerance (every sector must be read or accepted)")
     replicas: list[ReplicaInput] = Field(default_factory=list)
     custody_events: list[CustodyEvent] = Field(default_factory=list)
     expected_total_sha256: Optional[str] = Field(
@@ -160,6 +282,69 @@ class ChunkContentVerification(ForensicModel):
     digest_verified: bool = False
 
 
+class ReadAttemptRecord(ForensicModel):
+    """One submitted attempt, in submission order, with provenance context."""
+
+    attempt_id: str
+    session_id: str
+    chunk_id: str
+    start_sector: int
+    end_sector: int
+    round: int
+    result: str
+    tool_error_code: Optional[str] = None
+    actual_read_length: int
+    fill_method: Optional[str] = None
+    fill_value: Optional[int] = None
+    sparse_hole: bool = False
+    sha256: Optional[str] = None
+    note: Optional[str] = None
+    # Whether the bound chunk is one of the effective chunks participating in
+    # image reconstruction (as opposed to a corrected/deduplicated old chunk).
+    effective: bool = True
+
+
+class FinalSegment(ForensicModel):
+    """One atomic source sector range in the reconstructed image."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    chunk_id: str
+    session_id: Optional[str] = None
+    # read           -> bytes really read from the source
+    # fill           -> declared zero/pattern padding or sparse hole
+    # unrecovered    -> never read; sealable only when covered by an accepted
+    #                   exception (exception_id then set)
+    kind: Literal["read", "fill", "unrecovered"]
+    winning_attempt_id: Optional[str] = None
+    exception_id: Optional[str] = None
+    fill_method: Optional[str] = None
+    fill_value: Optional[int] = None
+    sparse_hole: bool = False
+    tool_error_code: Optional[str] = None
+    attempts: list[str] = Field(default_factory=list)
+    sha256: Optional[str] = None  # read: digest of the real bytes at this range
+    content_ok: bool = True       # recompute-time flag (digest/fill/hole check)
+
+
+class RecoveryState(ForensicModel):
+    provenance_mode: Literal["attempts", "legacy-content-only"] = "legacy-content-only"
+    attempts: list[ReadAttemptRecord] = Field(default_factory=list)
+    segments: list[FinalSegment] = Field(default_factory=list)
+    total_sectors: int = 0
+    read_sectors: int = 0
+    filled_sectors: int = 0
+    unrecovered_sectors: int = 0
+    accepted_sectors: int = 0
+    recovered_sectors: int = 0           # real reads + accepted exceptions
+    recovery_rate: float = 0.0           # (read + accepted) / total
+    fill_rate: float = 0.0               # filled / total
+    unrecovered_rate: float = 0.0        # unaccepted unrecovered / total
+    freeze_policy: Optional[dict[str, Any]] = None
+    freeze_ok: bool = True
+    exceptions: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class Overlap(ForensicModel):
     start_sector: int
     end_sector: int  # exclusive
@@ -186,6 +371,7 @@ class EvaluationReport(ForensicModel):
     reconstructed_sha256: Optional[str] = None
     expected_total_sha256: Optional[str] = None
     total_hash_verified: Optional[bool] = None
+    recovery: RecoveryState = Field(default_factory=RecoveryState)
     sealable: bool = False
 
     def error(self, code: str, message: str, **kw: Any) -> None:
@@ -266,3 +452,20 @@ class DiffReport(ForensicModel):
     merkle_root_right: Optional[str] = None
     reconstructed_sha256_left: Optional[str] = None
     reconstructed_sha256_right: Optional[str] = None
+    # ---- bad-sector retry / fill provenance (same attempt records as precheck,
+    # evidence package and recompute) --------------------------------------
+    attempts_added: list[str] = Field(default_factory=list)
+    attempts_removed: list[str] = Field(default_factory=list)
+    attempt_results_changed: list[str] = Field(
+        default_factory=list,
+        description="attempt ids present in both revisions whose interval, "
+                    "round, result, actual_read_length or fill declaration "
+                    "changed")
+    exceptions_added: list[str] = Field(default_factory=list)
+    exceptions_removed: list[str] = Field(default_factory=list)
+    recovery_rate_left: float = 0.0
+    recovery_rate_right: float = 0.0
+    unrecovered_sectors_left: int = 0
+    unrecovered_sectors_right: int = 0
+    accepted_sectors_left: int = 0
+    accepted_sectors_right: int = 0
