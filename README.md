@@ -27,7 +27,7 @@
 | `WRITE_BLOCKER_MISSING / _FAILED / _SELF_TEST_MISMATCH` | 缺写保校验、校验未通过、自检摘要不符 |
 | `CHUNK_MISALIGNED / _OUT_OF_RANGE / _EMPTY` | 偏移或长度不按扇区对齐、越过容量、零长 |
 | `CHUNK_CONTENT_UNAVAILABLE / _FILE_UNREADABLE / _FILE_OUTSIDE_ROOT / _CONTENT_BAD_BASE64` | **硬门槛**：无内联内容也无登记路径、分块文件不可读、路径逃逸证据根、Base64 非法——每块摘要必须能从真实字节复算 |
-| `CHUNK_CONTENT_LENGTH_MISMATCH / CHUNK_DIGEST_MISMATCH` | **硬门槛**：登记文件实际长度或重算 SHA-256 与清单声明冲突（warning 仅用于已被纠错取代的块） |
+| `CHUNK_CONTENT_LENGTH_MISMATCH / CHUNK_DIGEST_MISMATCH` | **硬门槛**：登记文件实际长度或重算 SHA-256 与清单声明冲突。**所有登记块都必须通过**，包括被 `correction_of` 取代的旧块——`correction_of` 只决定哪个块代表镜像区间，不免除旧块核验 |
 | `IMAGE_HASH_NOT_RECOMPUTABLE` | **硬门槛**：任一块无法核验时，整盘线性哈希不可重建；不再降级为 warning |
 | `TOTAL_HASH_MISMATCH` | 按偏移顺序拼接真实字节重算的整盘 SHA-256 与现场总哈希不一致（可抓出错序拼接） |
 | `CHUNK_DUPLICATE_RANGE`（warning） | 同区间同摘要的冗余块，自动去重保留其一 |
@@ -36,8 +36,7 @@
 | `CHUNK_OVERLAP` | 部分重叠，返回冲突扇区区间和涉及块 ID |
 | `COVERAGE_GAP` | 未覆盖扇区区间（半开区间 `[start,end)`，可直接定位缺块） |
 | `INDEX_ORDER_MISMATCH / INDEX_DUPLICATE` | 声明序号顺序与按偏移重建的块序不一致 / 序号重复 |
-| `TOTAL_HASH_MISMATCH` | 线性重算的整盘 SHA-256 与现场总哈希不一致 |
-| `REPLICA_CHAIN_EMPTY / REPLICA_NO_ACQUISITION`（硬门槛） | 零副本，或缺 `acquired` 采集件锚定整条链 |
+| `REPLICA_CHAIN_EMPTY / REPLICA_NO_ACQUISITION / REPLICA_CHAIN_NO_COPY_STAGE`（硬门槛） | 零副本、缺 `acquired` 采集件锚定、或唯一的 acquired 副本没有任何 `copy/archive`——即使它自身登记了 acquired+sealed+transferred 事件，未经过实际复制阶段也不能判为 proven |
 | `REPLICA_PARENT_UNKNOWN / _PARENT_MISSING / _COPY_DIGEST_MISMATCH` | 副本链断裂、复制件与母本摘要不一致 |
 | `CUSTODY_CHAIN_EMPTY / CUSTODY_NO_EVENTS / CUSTODY_EVENT_MISSING / CUSTODY_TERMINAL_NOT_HANDED_OVER / REPLICA_CHAIN_UNPROVEN`（硬门槛） | 零交接事件、某副本无事件、缺 acquired/copied 必需事件、末端副本未同时 sealed+transferred、无法证明采集→复制→封存移交的连续性 |
 | `ACQUIRED_DIGEST_MISMATCH / REPLICA_MERKLE_MISMATCH` | 采集件摘要/Merkle 与按真实字节重建的结果不一致 |
@@ -59,7 +58,9 @@ event_id` 与扇区区间，便于直接定位介质、区间和事件。
   `stored_path` 流式读取（1 MiB 分块，可处理大文件），逐块核对长度与 SHA-256；
   全部通过后按 `ordered_chunk_ids` 顺序流式拼接重算整盘 SHA-256，并与
   `expected_total_sha256` 对比。文件缺失、越权路径、截断、单块摘要冲突或总哈希不符，
-  均为 error 并拒绝封存（已被纠错取代的旧块不可读只记 warning）。证据根目录由
+  均为 error 并拒绝封存。**所有登记块（包括 `correction_of` 取代的旧块）都必须
+  通过读取、长度和摘要核验**：纠错只决定有效块（哪个块参与覆盖/Merkle/线性拼接），
+  旧块不可读、截断或摘要冲突同样拒绝封存；旧块不参与整盘线性哈希。证据根目录由
   环境变量 `EVIDENCE_ROOTS`（冒号分隔，默认 `data/evidence`）限定，相对路径相对
   根目录解析；根目录之外的路径一律拒绝。
 
@@ -98,13 +99,16 @@ event_id` 与扇区区间，便于直接定位介质、区间和事件。
 预检、封存和证据包复算都要求记录能**证明**摘要连续性，否则拒绝封存、证据包 `valid=false`：
 
 1. 至少一个 `acquired` 副本且绑定真实采集会话，其摘要必须等于按字节重建的整盘摘要；
-2. 每个 `copy/archive` 必须声明父副本，且父子 SHA-256 完全一致；
-3. 每个副本至少有一个交接事件；采集件必须有 `acquired` 事件，每个复制件必须有
+2. 链中必须存在**实际复制阶段**：至少一个 `copy/archive` 副本；唯一的 acquired
+   副本即使自身具备 acquired、sealed、transferred 事件，也不能判为 proven
+   （`REPLICA_CHAIN_NO_COPY_STAGE` / `REPLICA_CHAIN_UNPROVEN`）；
+3. 每个 `copy/archive` 必须声明父副本，且父子 SHA-256 完全一致；
+4. 每个副本至少有一个交接事件；采集件必须有 `acquired` 事件，每个复制件必须有
    `copied` 事件；
-4. 链末端（无下游副本的 leaf）必须**同时**具备 `sealed` 与 `transferred` 事件；
-5. 每个事件的 `digest_before` 必须承接副本摘要或上一事件的 `digest_after`，
+5. 链末端（无下游副本的 leaf）必须**同时**具备 `sealed` 与 `transferred` 事件；
+6. 每个事件的 `digest_before` 必须承接副本摘要或上一事件的 `digest_after`，
    `digest_after`/`expected_digest` 必须恒等于副本摘要。
-6. 存在一条 acquired → … → 末端的完整可达路径（`provenance_path` 写入报告）。
+7. 存在一条 acquired → 复制阶段 → 末端的完整可达路径（`provenance_path` 写入报告）。
 
 零副本、零事件、缺必需事件、末端未封存移交、摘要断链或路径不可达，分别报
 `REPLICA_CHAIN_EMPTY / CUSTODY_CHAIN_EMPTY / CUSTODY_EVENT_MISSING /
@@ -134,7 +138,7 @@ EVIDENCE_ROOTS=/var/evidence:/mnt/raid/acquisitions \
 测试：
 
 ```bash
-pytest -q          # 43 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
+pytest -q          # 51 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
                    # 文件型分块读取/缺件/截断/错序拼接、零副本零事件、证据包复算等
 ```
 
@@ -176,5 +180,5 @@ app/
   evidence.py   证据包构造、修订比较
   db.py         SQLite 建表、事务化修订写入、封存/预检持久化
   main.py       FastAPI 路由
-tests/          43 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块）
+tests/          51 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块）
 ```

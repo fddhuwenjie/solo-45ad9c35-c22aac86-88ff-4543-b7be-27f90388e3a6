@@ -92,8 +92,20 @@ def analyze_replica_custody(
         out("error", "REPLICA_NO_ACQUISITION",
             "no replica with role=acquired anchors the provenance chain")
 
+    # An actual replication stage is mandatory: the acquired replica alone,
+    # even with acquired/sealed/transferred events, does not prove that the
+    # image was ever copied or archived.
+    copied_replicas = [r for r in replicas
+                       if _get(r, "role") in ("copy", "archive")]
+    if not copied_replicas:
+        out("error", "REPLICA_CHAIN_NO_COPY_STAGE",
+            "the only replica is role=acquired; a copy/archive replica is "
+            "required to prove a real replication stage before hand-over",
+            replica_ids=[_get(r, "replica_id") for r in acquired])
+
     # per-replica structural rules
-    structurally_valid = bool(replicas) and bool(acquired) and not dup
+    structurally_valid = (bool(replicas) and bool(acquired)
+                          and bool(copied_replicas) and not dup)
     image_ok_for: set[str] = set()
     image_digest = image_digest or expected_total_sha256
     for r in replicas:
@@ -251,37 +263,47 @@ def analyze_replica_custody(
             custody_valid = False
 
     # --------------------- continuity path acquired -> terminal -------------
+    # The proven path must exist structurally independent of the other errors:
+    # even when per-replica/custody checks fail elsewhere, the absence of a
+    # copy/archive stage on any acquisition -> terminal path is reported.
     proven = False
     chain_path: list[str] = []
-    if structurally_valid and custody_valid:
+    if bool(acquired):
         children: dict[str, list[str]] = {}
         for r in replicas:
             pid = _get(r, "parent_replica_id")
             if pid:
                 children.setdefault(pid, []).append(_get(r, "replica_id"))
 
-        def walk(rid: str, path: list[str]) -> bool:
+        def walk(rid: str, path: list[str], saw_copy: bool = False) -> bool:
+            role = _get(by_id.get(rid), "role")
+            saw_copy = saw_copy or role in ("copy", "archive")
             types_present = {_get(e, "event_type")
                              for e in events_by_replica.get(rid, [])}
             req = required_types.get(rid, set())
             if not req <= types_present:
                 return False
-            if rid in sealed_terminals:
+            # Success requires a real replication stage on the path; an
+            # acquired replica can never terminate the proven chain by itself.
+            if rid in sealed_terminals and saw_copy:
                 chain_path[:] = path + [rid]
                 return True
             for child in sorted(children.get(rid, [])):
-                if walk(child, path + [rid]):
+                if walk(child, path + [rid], saw_copy):
                     return True
             return False
 
         proven = any(walk(_get(r, "replica_id"), []) for r in acquired)
-        if not proven:
-            out("error", "REPLICA_CHAIN_UNPROVEN",
-                "records cannot prove digest continuity from acquisition through "
-                "copy to a sealed, transferred terminal replica")
+
+    if replicas and not proven:
+        out("error", "REPLICA_CHAIN_UNPROVEN",
+            "records cannot prove digest continuity from acquisition through "
+            "a copy/archive replica to a sealed, transferred terminal")
 
     state.replica_ok = structurally_valid
     state.custody_ok = custody_valid
-    state.proven = proven
+    # proven requires the reachable copy-stage path AND every structural and
+    # custody check above (digest chaining included).
+    state.proven = proven and structurally_valid and custody_valid
     state.chain_path = chain_path
     return state

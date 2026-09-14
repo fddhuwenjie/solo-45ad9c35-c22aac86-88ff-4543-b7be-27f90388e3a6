@@ -393,39 +393,56 @@ def recompute_evidence(body: dict[str, Any]):
     merkle_ok = bool(ordered) and merkle_recomputed == computed.get("merkle_root")
 
     # ---- hard per-chunk verification against actual bytes -----------------
+    # Effective chunks are streamed once into both leaf and image hashers;
+    # every *other registered* chunk (e.g. an old chunk superseded via
+    # correction_of) is also hard-verified, but excluded from the image hash.
     chunk_checks: list[dict[str, Any]] = []
     chunk_content_ok = bool(ordered)
     linear = None
     total_hash_ok = None
     if payload is not None and ordered:
         by_id = {c.chunk_id: c for c in payload.chunks}
-        effective_models = [by_id[c["chunk_id"]] for c in ordered
-                            if c["chunk_id"] in by_id]
-        verified = 0
+        effective_models = [by_id[cid] for cid in ordered_ids if cid in by_id]
+        effective_id_set = {m.chunk_id for m in effective_models}
+        effective_verified = 0
+        all_verified = True
         image_hasher = hashlib.sha256()
-        for model in effective_models:
-            # single streaming read feeds both the leaf digest and the
-            # offset-order whole-image hasher
-            result = _content_resolver.inspect(model, image_hasher)
+
+        def _verify(model, feeds_image: bool) -> None:
+            nonlocal effective_verified, all_verified
+            result = (_content_resolver.inspect(model, image_hasher)
+                      if feeds_image else _content_resolver.inspect(model))
             length_ok = result.readable and result.length == model.length
             digest_ok = result.readable and result.sha256 == model.sha256
             row_ok = length_ok and digest_ok
-            if row_ok:
-                verified += 1
+            if row_ok and feeds_image:
+                effective_verified += 1
+            if not row_ok:
+                all_verified = False
             chunk_checks.append({
                 "chunk_id": model.chunk_id, "source": result.source,
                 "readable": result.readable,
                 "stored_path": result.registered_path,
+                "effective": feeds_image,
                 "length_ok": length_ok,
                 "digest_ok": digest_ok,
                 "error_code": result.error_code,
             })
-        chunk_content_ok = verified == len(effective_models)
-        if chunk_content_ok:
+
+        for model in effective_models:
+            _verify(model, True)
+        for model in payload.chunks:
+            if model.chunk_id not in effective_id_set:
+                _verify(model, False)
+
+        chunk_content_ok = all_verified and bool(payload.chunks)
+        if effective_verified == len(effective_models) and effective_models:
             linear = image_hasher.hexdigest()
             expected = submission.get("expected_total_sha256")
             if expected:
                 total_hash_ok = linear == expected
+        else:
+            chunk_content_ok = False
 
     # ---- replica/custody minimum chain over recorded digests --------------
     chain_ok = False

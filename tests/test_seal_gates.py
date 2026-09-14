@@ -293,3 +293,295 @@ def test_full_chain_proven_path_recorded(client):
     assert created["report"]["provenance_path"] == ["R-ACQ", "R-CPY", "R-ARC"]
     assert created["report"]["terminal_replica_ids"] == ["R-ARC"]
     assert seal(client, created["manifest_id"]).status_code == 200
+
+
+# ===================================== counterexample 1: no real copy stage ==
+def _acquired_only_payload(media_id, *, with_transfer=True):
+    """Single acquired replica that itself carries acquired/sealed/transferred."""
+    from tests.conftest import T0
+    from datetime import timedelta
+
+    payload = build_payload(media_id=media_id)
+    digest = next(r for r in payload["replicas"]
+                  if r["replica_id"] == "R-ACQ")["sha256"]
+    payload["replicas"] = [r for r in payload["replicas"]
+                           if r["replica_id"] == "R-ACQ"]
+    keep = {"acquired", "verified", "sealed"}
+    if with_transfer:
+        keep.add("transferred")
+    payload["custody_events"] = [e for e in payload["custody_events"]
+                                 if e["replica_id"] == "R-ACQ"
+                                 and e["event_type"] in keep]
+    if with_transfer and not any(e["event_type"] == "transferred"
+                                 for e in payload["custody_events"]):
+        # build_payload never transfers R-ACQ; register it explicitly so the
+        # counterexample is exactly "acquired replica with all three events"
+        payload["custody_events"].append({
+            "event_id": "E-R-ACQ-XFR", "event_type": "transferred",
+            "replica_id": "R-ACQ",
+            "at": (T0 + timedelta(days=1)).isoformat(),
+            "actor": "qian.wu", "organization": "证据管理室",
+            "counterpart": "司法鉴定中心-接收人 sun.li",
+            "digest_before": digest, "digest_after": digest,
+            "expected_digest": digest})
+    return payload
+
+
+def test_acquired_only_with_seal_and_transfer_is_not_proven(client):
+    # The defect: a sole acquired replica registered acquired+sealed+
+    # transferred events must still fail -- no copy/archive stage exists.
+    payload = _acquired_only_payload("M-ACQ-ONLY")
+    created = post_manifest(client, payload).json()
+    codes = set(_codes(created))
+    assert "REPLICA_CHAIN_NO_COPY_STAGE" in codes
+    assert "REPLICA_CHAIN_UNPROVEN" in codes
+    f = next(x for x in created["report"]["findings"]
+             if x["code"] == "REPLICA_CHAIN_NO_COPY_STAGE")
+    assert f["replica_ids"] == ["R-ACQ"]
+    assert created["report"]["replica_chain_proven"] is False
+    assert created["report"]["provenance_path"] == []
+    assert created["report"]["sealable"] is False
+
+    r = seal(client, created["manifest_id"])
+    assert r.status_code == 409
+    blocker_codes = {x["code"]
+                     for x in r.json()["detail"]["blocking_findings"]}
+    assert {"REPLICA_CHAIN_NO_COPY_STAGE", "REPLICA_CHAIN_UNPROVEN"} \
+        <= blocker_codes
+
+
+def test_acquired_only_chain_fails_precheck_and_package_recompute(client):
+    payload = _acquired_only_payload("M-ACQ-ONLY-PC")
+    sid = post_manifest(client, payload).json()["manifest_id"]
+
+    pre = client.post(f"/manifests/{sid}/precheck").json()
+    assert pre["sealable"] is False
+    assert "REPLICA_CHAIN_NO_COPY_STAGE" in [f["code"] for f in pre["findings"]]
+    assert seal(client, sid).status_code == 409
+
+    # evidence package exists for a draft too; recompute must not say valid
+    pkg = client.get(f"/manifests/{sid}/evidence-package").json()
+    rec = client.post("/evidence/recompute", json=pkg).json()
+    assert rec["valid"] is False
+    assert rec["checks"]["replica_custody_chain_ok"] is False
+    assert rec["chain"]["proven"] is False
+
+
+def test_acquired_with_copy_but_terminal_not_transferred_still_unproven(client):
+    # acquired + one copy replica proves the replication stage, but without
+    # sealed+transferred on the copy terminal it still cannot be proven
+    payload = build_payload(media_id="M-COPY-NO-XFR")
+    payload["replicas"] = [r for r in payload["replicas"]
+                           if r["replica_id"] in ("R-ACQ", "R-CPY")]
+    payload["custody_events"] = [
+        e for e in payload["custody_events"]
+        if e["replica_id"] in ("R-ACQ", "R-CPY")]
+    # keep the copy's copied+sealed but drop nothing else: copy is a terminal
+    # lacking transferred
+    created = post_manifest(client, payload).json()
+    codes = set(_codes(created))
+    assert "REPLICA_CHAIN_NO_COPY_STAGE" not in codes  # copy stage present
+    assert "CUSTODY_TERMINAL_NOT_HANDED_OVER" in codes
+    assert created["report"]["replica_chain_proven"] is False
+    assert seal(client, created["manifest_id"]).status_code == 409
+
+
+def test_tampering_package_to_drop_copy_replica_invalidates_recompute(client):
+    payload = build_payload(media_id="M-PKG-DROPCOPY")
+    sid = post_manifest(client, payload).json()["manifest_id"]
+    assert seal(client, sid).status_code == 200
+    pkg = client.get(f"/manifests/{sid}/evidence-package").json()
+
+    edited = copy.deepcopy(pkg)
+    sub = edited["submission"]
+    sub["replicas"] = [r for r in sub["replicas"]
+                       if r["replica_id"] == "R-ACQ"]
+    sub["custody_events"] = [e for e in sub["custody_events"]
+                             if e["replica_id"] == "R-ACQ"]
+    rec = client.post("/evidence/recompute", json=edited).json()
+    assert rec["valid"] is False
+    assert rec["checks"]["replica_custody_chain_ok"] is False
+
+
+# ===================== counterexample 2: superseded old chunk still verified ==
+def _sealed_correction_base(client, media_id):
+    p1 = build_payload(media_id=media_id)
+    v1 = post_manifest(client, p1).json()
+    assert seal(client, v1["manifest_id"]).status_code == 200
+    return v1
+
+
+def _correction_payload(parent_id, media_id, *, make_old_unreadable=False,
+                        truncate_old=False, corrupt_old_digest_decl=False):
+    """Build a v2 correction: C02X supersedes C02 at the same range.
+
+    By default the superseded C02 still carries valid inline content.
+    Flags simulate defects of the registered old chunk.
+    """
+    import base64
+    import hashlib
+
+    from tests.conftest import chunk_bytes
+
+    p2 = build_payload(media_id=media_id, change_kind="correction",
+                       parent=parent_id)
+    c02 = next(c for c in p2["chunks"] if c["chunk_id"] == "C02")
+    data = b"erased-bad-sector-reimage".ljust(c02["length"], b"\x05")
+    corrected = copy.deepcopy(c02)
+    corrected.update({"chunk_id": "C02X",
+                      "sha256": hashlib.sha256(data).hexdigest(),
+                      "content_b64": base64.b64encode(data).decode(),
+                      "correction_of": "C02",
+                      "note": "re-imaged after read error on sector 16"})
+    p2["chunks"].append(corrected)
+    new_image = b"".join(data if i == 1 else chunk_bytes(i)
+                         for i in range(4))
+    expected = hashlib.sha256(new_image).hexdigest()
+    p2["expected_total_sha256"] = expected
+    for rep in p2["replicas"]:
+        rep["sha256"] = expected
+    for ev in p2["custody_events"]:
+        for key in ("digest_before", "digest_after", "expected_digest"):
+            if ev.get(key):
+                ev[key] = expected
+
+    old = next(c for c in p2["chunks"] if c["chunk_id"] == "C02")
+    if make_old_unreadable:
+        old["stored_path"] = "media/MISSING-C02.dd"
+        old.pop("content_b64", None)
+    elif truncate_old:
+        old["content_b64"] = base64.b64encode(
+            chunk_bytes(1)[: old["length"] // 2]).decode()
+    elif corrupt_old_digest_decl:
+        # bytes stay valid inline content, but declared digest is wrong
+        old["sha256"] = "f" * 64
+    return p2
+
+
+def test_superseded_old_chunk_unreadable_blocks_seal(client, evidence_root):
+    v1 = _sealed_correction_base(client, "M-CORR-MISSING")
+    p2 = _correction_payload(v1["manifest_id"], "M-CORR-MISSING",
+                             make_old_unreadable=True)
+    created = post_manifest(client, p2).json()
+    codes = set(_codes(created))
+    # hard error, never a *_SUPERSEDED warning
+    assert "CHUNK_FILE_UNREADABLE" in codes
+    assert not any(c.endswith("_SUPERSEDED") for c in codes)
+    f = next(x for x in created["report"]["findings"]
+             if x["code"] == "CHUNK_FILE_UNREADABLE")
+    assert f["chunk_ids"] == ["C02"]
+    assert f["detail"]["effective"] is False
+    # correction chunk itself still reconstructs the image, but the manifest
+    # cannot be sealed while the registered old chunk is unverifiable
+    assert created["report"]["all_chunk_digests_verified"] is False
+    assert created["report"]["sealable"] is False
+    r = seal(client, created["manifest_id"])
+    assert r.status_code == 409
+    assert "CHUNK_FILE_UNREADABLE" in {x["code"]
+                                       for x in r.json()["detail"]["blocking_findings"]}
+
+    pkg = client.get(
+        f"/manifests/{created['manifest_id']}/evidence-package").json()
+    rec = client.post("/evidence/recompute", json=pkg).json()
+    assert rec["valid"] is False
+    assert rec["checks"]["chunk_content_ok"] is False
+    bad = [c for c in rec["chunk_checks"] if c["chunk_id"] == "C02"]
+    assert bad and bad[0]["readable"] is False and bad[0]["effective"] is False
+
+
+def test_superseded_old_chunk_truncated_blocks_seal(client):
+    v1 = _sealed_correction_base(client, "M-CORR-TRUNC")
+    p2 = _correction_payload(v1["manifest_id"], "M-CORR-TRUNC",
+                             truncate_old=True)
+    created = post_manifest(client, p2).json()
+    codes = set(_codes(created))
+    assert "CHUNK_CONTENT_LENGTH_MISMATCH" in codes
+    f = next(x for x in created["report"]["findings"]
+             if x["code"] == "CHUNK_CONTENT_LENGTH_MISMATCH"
+             and x["chunk_ids"] == ["C02"])
+    assert f["detail"]["effective"] is False
+    assert created["report"]["sealable"] is False
+    assert seal(client, created["manifest_id"]).status_code == 409
+
+    pkg = client.get(
+        f"/manifests/{created['manifest_id']}/evidence-package").json()
+    rec = client.post("/evidence/recompute", json=pkg).json()
+    assert rec["valid"] is False
+    assert rec["checks"]["chunk_content_ok"] is False
+    old_check = next(c for c in rec["chunk_checks"] if c["chunk_id"] == "C02")
+    assert old_check["length_ok"] is False and old_check["effective"] is False
+
+
+def test_superseded_old_chunk_digest_conflict_blocks_seal(client):
+    v1 = _sealed_correction_base(client, "M-CORR-DIG")
+    p2 = _correction_payload(v1["manifest_id"], "M-CORR-DIG",
+                             corrupt_old_digest_decl=True)
+    created = post_manifest(client, p2).json()
+    f = next(x for x in created["report"]["findings"]
+             if x["code"] == "CHUNK_DIGEST_MISMATCH"
+             and x["chunk_ids"] == ["C02"])
+    assert f["detail"]["effective"] is False
+    assert created["report"]["sealable"] is False
+    r = seal(client, created["manifest_id"])
+    assert r.status_code == 409
+    assert "CHUNK_DIGEST_MISMATCH" in {x["code"]
+                                      for x in r.json()["detail"]["blocking_findings"]}
+
+    pkg = client.get(
+        f"/manifests/{created['manifest_id']}/evidence-package").json()
+    rec = client.post("/evidence/recompute", json=pkg).json()
+    assert rec["valid"] is False
+    old_check = next(c for c in rec["chunk_checks"] if c["chunk_id"] == "C02")
+    assert old_check["digest_ok"] is False
+
+
+def test_correction_with_old_chunk_file_on_disk_verifies_and_seals(
+        client, evidence_root):
+    # positive counterpart: old C02 registered as a readable file with its
+    # original digest, C02X inline -> both verify, seal allowed (regression
+    # guard so the hard rule does not over-block legitimate corrections)
+    import base64
+
+    from tests.conftest import chunk_bytes
+
+    v1 = _sealed_correction_base(client, "M-CORR-OK2")
+    p2 = build_payload(media_id="M-CORR-OK2", change_kind="correction",
+                       parent=v1["manifest_id"])
+    c02 = next(c for c in p2["chunks"] if c["chunk_id"] == "C02")
+    # place the OLD content on disk and point the superseded chunk at it
+    old_path = evidence_root / "media" / "C02.dd"
+    old_path.parent.mkdir(parents=True, exist_ok=True)
+    old_path.write_bytes(chunk_bytes(1))
+    c02.pop("content_b64", None)
+    c02["stored_path"] = "media/C02.dd"
+
+    import hashlib
+    data = b"erased-bad-sector-reimage".ljust(c02["length"], b"\x05")
+    corrected = copy.deepcopy(c02)
+    corrected.update({"chunk_id": "C02X", "index": 1,
+                      "sha256": hashlib.sha256(data).hexdigest(),
+                      "content_b64": base64.b64encode(data).decode(),
+                      "correction_of": "C02",
+                      "stored_path": None,
+                      "note": "re-imaged after read error"})
+    p2["chunks"].append(corrected)
+    new_image = b"".join(data if i == 1 else chunk_bytes(i)
+                         for i in range(4))
+    expected = hashlib.sha256(new_image).hexdigest()
+    p2["expected_total_sha256"] = expected
+    for rep in p2["replicas"]:
+        rep["sha256"] = expected
+    for ev in p2["custody_events"]:
+        for key in ("digest_before", "digest_after", "expected_digest"):
+            if ev.get(key):
+                ev[key] = expected
+
+    created = post_manifest(client, p2).json()
+    assert created["report"]["sealable"] is True, created["report"]["findings"]
+    applied = [f for f in created["report"]["findings"]
+               if f["code"] == "CHUNK_CORRECTION_APPLIED"]
+    assert len(applied) == 1
+    rows = {c["chunk_id"]: c for c in created["report"]["chunk_content"]}
+    assert rows["C02"]["digest_verified"] and rows["C02"]["source"] == "file"
+    assert rows["C02X"]["digest_verified"] and rows["C02X"]["source"] == "inline"
+    assert seal(client, created["manifest_id"]).status_code == 200

@@ -251,10 +251,11 @@ def evaluate(payload,
     # ---- actual content verification (inline base64 or registered files) --
     # Effective chunks are streamed exactly once in reconstructed offset
     # order: each read feeds both the chunk leaf hasher and the whole-image
-    # hasher. Superseded/deduplicated chunks are inspected without the image
-    # hasher and only produce warnings. Every effective chunk must be located,
-    # length-checked and hash-checked; otherwise neither per-chunk digests nor
-    # the whole-image hash can be re-derived and sealing is impossible.
+    # hasher. Every *registered* chunk is hard-verified -- correction_of only
+    # decides which chunk represents the image range; it never exempts the
+    # superseded old chunk from read/length/digest verification. An unreadable,
+    # truncated or digest-conflicting old chunk is therefore a hard error that
+    # blocks sealing; only effective chunks feed the whole-image hasher.
     effective_ids = {c.chunk_id for c in effective}
     content_rows: dict[str, ChunkContentVerification] = {}
     image_hasher = hashlib.sha256()
@@ -284,54 +285,46 @@ def evaluate(payload,
             length=result.length, sha256=result.sha256,
             declared_sha256=c.sha256, digest_verified=False)
         content_rows[c.chunk_id] = row
+        superseded_note = ("" if effective_chunk
+                           else " (chunk superseded by a correction but still "
+                                "registered; its content must verify)")
 
         if not result.readable:
             code = result.error_code or "CHUNK_CONTENT_UNAVAILABLE"
-            message = _content_failure_message(c, code)
-            if effective_chunk:
-                report.error(code, message, chunk_ids=[c.chunk_id],
-                             detail=result.error_detail)
-            else:
-                report.warn(code + "_SUPERSEDED",
-                            message + " (chunk superseded; not part of the image)",
-                            chunk_ids=[c.chunk_id], detail=result.error_detail)
+            report.error(code,
+                         _content_failure_message(c, code) + superseded_note,
+                         chunk_ids=[c.chunk_id],
+                         detail={**(result.error_detail or {}),
+                                 "effective": effective_chunk})
             return
 
         if result.length != c.length:
-            message = (f"chunk {c.chunk_id}: actual content is {result.length} "
-                       f"bytes but manifest declares {c.length}")
-            if effective_chunk:
-                report.error("CHUNK_CONTENT_LENGTH_MISMATCH", message,
-                             chunk_ids=[c.chunk_id],
-                             detail={"declared": c.length,
-                                     "actual": result.length,
-                                     "source": result.source})
-            else:
-                report.warn("CHUNK_CONTENT_LENGTH_MISMATCH_SUPERSEDED",
-                            message + " (chunk superseded)",
-                            chunk_ids=[c.chunk_id])
+            report.error(
+                "CHUNK_CONTENT_LENGTH_MISMATCH",
+                f"chunk {c.chunk_id}: actual content is {result.length} bytes "
+                f"but manifest declares {c.length}" + superseded_note,
+                chunk_ids=[c.chunk_id],
+                detail={"declared": c.length, "actual": result.length,
+                        "source": result.source,
+                        "effective": effective_chunk})
             return
 
         row.digest_verified = result.sha256 == c.sha256
         if not row.digest_verified:
-            message = (f"chunk {c.chunk_id}: recomputed SHA-256 from "
-                       f"{result.source} content conflicts with the manifest")
-            if effective_chunk:
-                report.error("CHUNK_DIGEST_MISMATCH", message,
-                             chunk_ids=[c.chunk_id],
-                             detail={"declared": c.sha256,
-                                     "actual": result.sha256,
-                                     "source": result.source,
-                                     "stored_path": result.registered_path})
-            else:
-                report.warn("CHUNK_DIGEST_MISMATCH_SUPERSEDED",
-                            message + " (chunk superseded)",
-                            chunk_ids=[c.chunk_id])
+            report.error(
+                "CHUNK_DIGEST_MISMATCH",
+                f"chunk {c.chunk_id}: recomputed SHA-256 from {result.source} "
+                f"content conflicts with the manifest" + superseded_note,
+                chunk_ids=[c.chunk_id],
+                detail={"declared": c.sha256, "actual": result.sha256,
+                        "source": result.source,
+                        "stored_path": result.registered_path,
+                        "effective": effective_chunk})
 
     # 1) effective chunks in reconstructed offset order -> single streaming pass
     for c in effective:
         _inspect_chunk(c, True)
-    # 2) superseded / deduplicated chunks -> warnings only, no image hashing
+    # 2) superseded / deduplicated chunks: no image hashing, but hard-verified
     for c in chunks:
         if c.chunk_id not in effective_ids:
             _inspect_chunk(c, False)
@@ -339,22 +332,26 @@ def evaluate(payload,
     report.chunk_content = [content_rows[cid] for cid in sorted(content_rows)]
     effective_verified = sum(
         1 for cid in effective_ids if content_rows[cid].digest_verified)
+    all_registered_verified = all(r.digest_verified
+                                  for r in content_rows.values())
     report.all_chunk_digests_verified = (
-        bool(effective) and effective_verified == len(effective))
+        bool(effective) and effective_verified == len(effective)
+        and all_registered_verified)
 
     # --------- Merkle root (declared leaf digests in reconstructed order) ----
     report.merkle_root = merkle_root([c.sha256 for c in effective])
 
     # ------- whole-image linear hash from the same single streaming pass -----
-    if report.all_chunk_digests_verified:
+    if effective_verified == len(effective) and bool(effective):
         report.reconstructed_sha256 = image_hasher.hexdigest()
-    else:
+    if report.reconstructed_sha256 is None:
         report.error(
             "IMAGE_HASH_NOT_RECOMPUTABLE",
-            "whole-image SHA-256 cannot be recomputed: one or more effective "
-            "chunks are missing, unreadable or digest-conflicting",
+            "whole-image SHA-256 cannot be recomputed: one or more registered "
+            "chunks are missing, unreadable, truncated or digest-conflicting",
             detail={"effective_chunks": len(effective),
-                    "verified": effective_verified})
+                    "effective_verified": effective_verified,
+                    "registered_chunks": len(content_rows)})
 
     if report.reconstructed_sha256 and payload.expected_total_sha256:
         if report.reconstructed_sha256 != payload.expected_total_sha256:
@@ -430,10 +427,4 @@ def evaluate(payload,
                        and report.all_chunk_digests_verified
                        and report.reconstructed_sha256 is not None
                        and report.replica_chain_proven)
-    return report
-
-    # ------------------------------------------------------------- verdict ---
-    has_errors = any(f.severity == Severity.error for f in report.findings)
-    report.sealable = (not has_errors and report.complete_coverage
-                       and report.merkle_root is not None)
     return report
