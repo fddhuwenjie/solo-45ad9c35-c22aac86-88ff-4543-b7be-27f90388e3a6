@@ -19,11 +19,17 @@ from .db import (
     get_db,
     get_inspection,
     get_inspection_by_id,
+    get_joint_inspection,
+    get_joint_inspection_by_id,
     get_manifest,
     get_media,
     insert_inspection,
+    insert_joint_binding,
+    insert_joint_inspection,
     insert_manifest,
     list_inspections,
+    list_joint_bindings,
+    list_joint_inspections,
     list_manifests,
     mark_sealed,
     save_precheck,
@@ -44,6 +50,7 @@ from .inspection import (
     generate_sample_plan,
     internal_seams,
 )
+from .joint import JointTaskContext, evaluate_joint_inspection
 from .recovery import analyze_recovery
 from .schemas import (
     DiffReport,
@@ -53,6 +60,10 @@ from .schemas import (
     InspectionHistoryReport,
     InspectionReport,
     InspectionSummary,
+    JointInspectionBindingCreate,
+    JointInspectionCreate,
+    JointInspectionReport,
+    JointInspectionSummary,
     ManifestCreate,
     ManifestCreated,
     MediaRecord,
@@ -92,7 +103,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Split-Image Forensic Evidence Verification API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Verify segmented disk acquisitions: sector coverage by offset, "
         "chunk-order reconstruction, SHA-256/Merkle roots, write-protector "
@@ -101,7 +112,11 @@ app = FastAPI(
         "create new revisions; sealed manifests stay read-only. Post-seal "
         "integrity inspections patrol handed-over replicas with a "
         "seed-deterministic sample plan (head/tail, chunk seams, random "
-        "sectors) and append-only tamper-evident history."
+        "sectors) and append-only tamper-evident history. Multi-replica "
+        "joint inspections freeze the participating replicas, one unified "
+        "seed/ratio and a completion window, then compare every replica "
+        "against the sealed baseline interval by interval to tell a single "
+        "rotting medium from a common multi-copy divergence."
     ),
     lifespan=lifespan,
 )
@@ -575,6 +590,167 @@ def inspection_history(manifest_id: str,
         divergent_intervals=divergent_intervals,
         first_change_at=first_change_at,
         inspections=[_inspection_summary(r) for r in reports])
+
+
+# ------------------------ multi-replica joint inspection (append-only) ----
+def _joint_report(conn: sqlite3.Connection,
+                  task_row: sqlite3.Row) -> JointInspectionReport:
+    """Evaluate a stored joint task against its append-only bindings.
+
+    The report is a pure function of the stored task row, the stored binding
+    rows and the immutable per-replica inspection records, so re-reading it
+    never rewrites history.
+    """
+    manifest_id = task_row["manifest_id"]
+    mrow = get_manifest(conn, manifest_id)
+    sealed_report = report_from_json(mrow["seal_report_json"])
+    sealed_payload = payload_from_row(mrow)
+    bindings = [dict(b) for b in list_joint_bindings(conn, task_row["joint_id"])]
+    inspections: dict[str, InspectionReport] = {}
+    for b in bindings:
+        iid = b["inspection_id"]
+        if iid not in inspections:
+            irow = get_inspection(conn, manifest_id, iid)
+            if irow is not None:
+                inspections[iid] = _stored_inspection_report(irow)
+    geom = sealed_payload.media.geometry
+    task = JointTaskContext(
+        joint_id=task_row["joint_id"], manifest_id=manifest_id,
+        media_id=task_row["media_id"],
+        replica_ids=json.loads(task_row["replica_ids_json"]),
+        seed=task_row["seed"], sample_ratio=task_row["sample_ratio"],
+        window_start=task_row["window_start"],
+        window_end=task_row["window_end"],
+        plan=json.loads(task_row["plan_json"]),
+        chunk_boundaries=json.loads(task_row["chunk_boundaries_json"]),
+        evidence_package_digest=task_row["evidence_package_digest"],
+        created_at=task_row["created_at"])
+    return evaluate_joint_inspection(
+        task, bindings=bindings, inspections=inspections,
+        total_sectors=int(geom.total_sectors),
+        image_sha256=(sealed_report.reconstructed_sha256 if sealed_report
+                      else mrow["reconstructed_sha256"]),
+        merkle_root=(sealed_report.merkle_root if sealed_report
+                     else mrow["merkle_root"]))
+
+
+def _joint_summary(report: JointInspectionReport) -> JointInspectionSummary:
+    participants = set(report.replica_ids)
+    return JointInspectionSummary(
+        joint_id=report.joint_id, result=report.result, seed=report.seed,
+        sample_ratio=report.sample_ratio, replica_ids=report.replica_ids,
+        submitted_replica_ids=sorted({b.replica_id for b in report.bindings
+                                      if b.replica_id in participants}),
+        binding_count=len(report.bindings),
+        window_start=report.window_start, window_end=report.window_end,
+        created_at=report.created_at)
+
+
+@app.post("/manifests/{manifest_id}/joint-inspections",
+          response_model=JointInspectionReport, status_code=201)
+def create_joint_inspection(manifest_id: str, payload: JointInspectionCreate,
+                            conn: sqlite3.Connection = Depends(get_db)):
+    """Open a multi-replica joint patrol task on a sealed manifest.
+
+    Freezes the sealed manifest, the evidence package digest, the
+    participating replicas, the unified seed, the sampling ratio and the
+    completion window, and derives the single sample plan every replica is
+    read against. Each replica then submits an ordinary inspection record
+    (same seed/ratio) and binds it via
+    ``POST .../joint-inspections/{joint_id}/submissions``. Tasks are
+    append-only: an existing joint_id is never rewritten (409).
+    """
+    row, sealed_payload, sealed_report, package_digest_ = \
+        _sealed_context(conn, manifest_id)
+    if get_joint_inspection_by_id(conn, payload.joint_id) is not None:
+        raise HTTPException(409, detail={
+            "code": "JOINT_INSPECTION_DUPLICATE",
+            "message": f"joint inspection {payload.joint_id} already exists; "
+                       "joint tasks are append-only and a re-test binds new "
+                       "inspection records instead of rewriting the task",
+            "joint_id": payload.joint_id})
+    registered = {r.replica_id for r in sealed_payload.replicas}
+    unknown = [rid for rid in payload.replica_ids if rid not in registered]
+    if unknown:
+        raise HTTPException(422, detail={
+            "code": "JOINT_REPLICA_UNKNOWN",
+            "message": "participating replicas must be registered in the "
+                       "sealed manifest",
+            "unknown_replica_ids": unknown})
+    geom = sealed_payload.media.geometry
+    ranges = chunk_sector_ranges(sealed_payload,
+                                 sealed_report.ordered_chunk_ids,
+                                 geom.sector_size)
+    seams = internal_seams(ranges)
+    plan = generate_sample_plan(geom.total_sectors, seams,
+                                payload.sample_ratio, payload.seed)
+    insert_joint_inspection(
+        conn, joint_id=payload.joint_id, manifest_id=manifest_id,
+        media_id=row["media_id"], replica_ids=payload.replica_ids,
+        seed=payload.seed, sample_ratio=payload.sample_ratio,
+        window_start=payload.window_start.isoformat(),
+        window_end=payload.window_end.isoformat(), plan=plan,
+        chunk_boundaries=seams, evidence_package_digest=package_digest_,
+        created_at=utcnow_iso())
+    task_row = get_joint_inspection(conn, manifest_id, payload.joint_id)
+    return _joint_report(conn, task_row)
+
+
+@app.get("/manifests/{manifest_id}/joint-inspections",
+         response_model=list[JointInspectionSummary])
+def list_manifest_joint_inspections(manifest_id: str,
+                                    conn: sqlite3.Connection = Depends(get_db)):
+    if get_manifest(conn, manifest_id) is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    return [_joint_summary(_joint_report(conn, task_row))
+            for task_row in list_joint_inspections(conn, manifest_id)]
+
+
+@app.get("/manifests/{manifest_id}/joint-inspections/{joint_id}",
+         response_model=JointInspectionReport)
+def read_joint_inspection(manifest_id: str, joint_id: str,
+                          conn: sqlite3.Connection = Depends(get_db)):
+    """Full joint report: per-interval cross-replica verdicts, per-replica
+    coverage, the append-only divergence history with first-appearance
+    times, and the bindings to the original inspection records."""
+    task_row = get_joint_inspection(conn, manifest_id, joint_id)
+    if task_row is None:
+        raise HTTPException(404, f"joint inspection {joint_id} not found for "
+                                 f"manifest {manifest_id}")
+    return _joint_report(conn, task_row)
+
+
+@app.post("/manifests/{manifest_id}/joint-inspections/{joint_id}/submissions",
+          response_model=JointInspectionReport, status_code=201)
+def bind_joint_submission(manifest_id: str, joint_id: str,
+                          payload: JointInspectionBindingCreate,
+                          conn: sqlite3.Connection = Depends(get_db)):
+    """Bind a submitted per-replica inspection record to the joint task
+    (append-only).
+
+    The replica is taken from the inspection record itself. Bindings are
+    never rejected for semantic mismatches — a plan/window/duplicate
+    violation is recorded and the joint evaluation stays ``inconclusive``,
+    so the attempt remains auditable. A re-test binds a NEW inspection
+    record; earlier bindings and their divergences are never erased.
+    """
+    task_row = get_joint_inspection(conn, manifest_id, joint_id)
+    if task_row is None:
+        raise HTTPException(404, f"joint inspection {joint_id} not found for "
+                                 f"manifest {manifest_id}")
+    insp_row = get_inspection(conn, manifest_id, payload.inspection_id)
+    if insp_row is None:
+        raise HTTPException(404, detail={
+            "code": "JOINT_INSPECTION_UNKNOWN",
+            "message": f"inspection {payload.inspection_id} not found for "
+                       f"manifest {manifest_id}; submit the per-replica "
+                       f"inspection first",
+            "inspection_id": payload.inspection_id})
+    insp = _stored_inspection_report(insp_row)
+    insert_joint_binding(conn, joint_id, payload.inspection_id,
+                         insp.replica_id, utcnow_iso())
+    return _joint_report(conn, task_row)
+
 
 @app.get("/media/{media_id}", response_model=MediaRecord)
 def read_media(media_id: str, conn: sqlite3.Connection = Depends(get_db)):

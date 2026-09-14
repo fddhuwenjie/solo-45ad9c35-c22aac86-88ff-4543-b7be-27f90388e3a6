@@ -608,6 +608,176 @@ class InspectionHistoryReport(ForensicModel):
     inspections: list[InspectionSummary] = Field(default_factory=list)
 
 
+# ------------------------------------- multi-replica joint inspection ----
+# A sealed master image usually survives as several copies on different media
+# (working disk, off-site disk, archive disk). Patrolling each copy with an
+# independent sample plan makes the reports hard to compare: the runs cover
+# different sectors, so one changed digest cannot be told apart from a common
+# upstream corruption. A joint inspection task freezes the sealed manifest,
+# the evidence package digest, the participating replicas, one unified seed,
+# one sampling ratio and a completion window; every replica is then read
+# against the SAME seed-derived plan intervals (submitted as ordinary
+# per-replica inspection records) and each record is bound to the task.
+
+
+class JointInspectionCreate(ForensicModel):
+    """Open a multi-replica joint patrol task on a sealed manifest."""
+
+    joint_id: str = Field(min_length=1,
+                          description="Unique id; joint tasks are append-only "
+                                      "and an existing id is never rewritten")
+    replica_ids: list[str] = Field(
+        min_length=1,
+        description="Participating replicas from the sealed manifest; every "
+                    "one of them must bind an inspection record")
+    seed: str = Field(min_length=1,
+                      description="Unified random seed; all replicas are read "
+                                  "against the same seed-derived plan")
+    sample_ratio: float = Field(gt=0.0, le=1.0,
+                                description="Unified sampling ratio")
+    window_start: datetime = Field(
+        description="Start of the frozen completion window (inclusive); "
+                    "readings must be taken inside the window")
+    window_end: datetime = Field(
+        description="End of the frozen completion window (inclusive)")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "JointInspectionCreate":
+        if self.window_end <= self.window_start:
+            raise ValueError("window_end must be after window_start")
+        if any(not rid or not rid.strip() for rid in self.replica_ids):
+            raise ValueError("replica_ids must not contain empty identifiers")
+        if len(set(self.replica_ids)) != len(self.replica_ids):
+            raise ValueError("replica_ids must not contain duplicates")
+        return self
+
+
+class JointInspectionBindingCreate(ForensicModel):
+    """Bind one submitted per-replica inspection record to a joint task."""
+
+    inspection_id: str = Field(min_length=1,
+                               description="Existing inspection record of this "
+                                           "manifest to bind; bindings are "
+                                           "append-only, a re-test binds a "
+                                           "new record")
+
+
+class JointBinding(ForensicModel):
+    """One append-only binding between a joint task and an inspection record."""
+
+    inspection_id: str
+    replica_id: str
+    bound_at: datetime
+
+
+class JointReplicaCell(ForensicModel):
+    """One replica's outcome for one planned interval inside a joint task."""
+
+    replica_id: str
+    inspection_id: Optional[str] = None
+    status: Literal["match", "digest-conflict", "read-failed", "missing",
+                    "unverifiable", "absent", "out-of-window"]
+    expected_sha256: Optional[str] = None
+    actual_sha256: Optional[str] = None
+    read_at: Optional[datetime] = None
+
+
+class JointIntervalResult(ForensicModel):
+    """Cross-replica verdict for one planned interval of a joint task."""
+
+    start_sector: int
+    end_sector: int  # exclusive
+    # all-match                -> every replica agrees with the sealed baseline
+    # single-replica-deviation -> exactly one replica provably diverges
+    # multi-replica-deviation  -> two or more replicas diverge from baseline
+    # missing-read             -> a replica is absent / skipped / unread / late
+    # baseline-unrecomputable  -> the frozen baseline cannot be recomputed;
+    #                             replicas agreeing with each other can NOT
+    #                             turn this into a pass
+    status: Literal["all-match", "single-replica-deviation",
+                    "multi-replica-deviation", "missing-read",
+                    "baseline-unrecomputable"]
+    expected_sha256: Optional[str] = None
+    deviating_replica_ids: list[str] = Field(default_factory=list)
+    missing_replica_ids: list[str] = Field(default_factory=list)
+    # For multi-replica deviations: True when the diverging replicas returned
+    # the *same* wrong digest (points at a common upstream corruption rather
+    # than independent media rot).
+    shared_deviation: Optional[bool] = None
+    cells: list[JointReplicaCell] = Field(default_factory=list)
+
+
+class JointReplicaCoverage(ForensicModel):
+    """Per-replica coverage inside a joint task, bound to the original
+    inspection record(s)."""
+
+    replica_id: str
+    status: Literal["complete", "partial", "absent"]
+    inspection_id: Optional[str] = Field(
+        None, description="Latest bound inspection record used for the "
+                          "current per-interval status")
+    bound_inspection_ids: list[str] = Field(
+        default_factory=list,
+        description="Every inspection record ever bound for this replica "
+                    "(append-only; re-tests add, never rewrite)")
+    result: Optional[str] = None
+    planned_sectors: int = 0
+    covered_sectors: int = 0
+    verified_sectors: int = 0
+    coverage_rate: float = 0.0
+    verified_rate: float = 0.0
+    cumulative_covered_sectors: int = 0
+    cumulative_coverage_rate: float = 0.0
+
+
+class JointInspectionReport(ForensicModel):
+    """Full JSON report of a multi-replica joint inspection task, bound to
+    the sealed evidence package and the original inspection records."""
+
+    joint_id: str
+    manifest_id: str
+    media_id: str
+    result: Literal["passed", "failed", "inconclusive"]
+    seed: str
+    sample_ratio: float
+    replica_ids: list[str]
+    window_start: datetime
+    window_end: datetime
+    chunk_boundaries: list[int] = Field(default_factory=list)
+    planned_intervals: list[SectorInterval] = Field(default_factory=list)
+    planned_sectors: int = 0
+    total_sectors: int = 0
+    sample_coverage: float = 0.0
+    intervals: list[JointIntervalResult] = Field(default_factory=list)
+    replica_coverage: list[JointReplicaCoverage] = Field(default_factory=list)
+    # Append-only divergence history across ALL bindings ever made: a later
+    # passing re-test never erases an earlier difference or its first-seen
+    # time, and every entry names the inspection record that first saw it.
+    divergent_intervals: list[DivergentInterval] = Field(default_factory=list)
+    first_change_at: Optional[datetime] = None
+    ever_failed: bool = False
+    findings: list[Finding] = Field(default_factory=list)
+    bindings: list[JointBinding] = Field(default_factory=list)
+    evidence_package_digest: Optional[str] = None
+    image_sha256: Optional[str] = None
+    merkle_root: Optional[str] = None
+    created_at: datetime
+
+
+class JointInspectionSummary(ForensicModel):
+    joint_id: str
+    result: str
+    seed: str
+    sample_ratio: float
+    replica_ids: list[str]
+    submitted_replica_ids: list[str]
+    binding_count: int
+    window_start: datetime
+    window_end: datetime
+    created_at: datetime
+
+
 class FieldChange(ForensicModel):
     field: str
     left: Any = None

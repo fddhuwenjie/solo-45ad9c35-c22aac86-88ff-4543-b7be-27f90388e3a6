@@ -138,6 +138,43 @@ CREATE INDEX IF NOT EXISTS idx_exceptions_range
     ON recovery_exceptions(manifest_id, start_sector, end_sector);
 CREATE INDEX IF NOT EXISTS idx_inspections_manifest
     ON inspections(manifest_id, created_at);
+
+-- Multi-replica joint inspection tasks are append-only: a task freezes the
+-- sealed manifest, the evidence package digest, the participating replicas,
+-- the unified seed, the sampling ratio, the completion window and the
+-- seed-derived plan; rows are never updated or deleted.
+CREATE TABLE IF NOT EXISTS joint_inspections (
+    joint_id               TEXT PRIMARY KEY,
+    manifest_id            TEXT NOT NULL REFERENCES manifests(manifest_id),
+    media_id               TEXT NOT NULL,
+    replica_ids_json       TEXT NOT NULL,
+    seed                   TEXT NOT NULL,
+    sample_ratio           REAL NOT NULL,
+    window_start           TEXT NOT NULL,
+    window_end             TEXT NOT NULL,
+    plan_json              TEXT NOT NULL,
+    chunk_boundaries_json  TEXT NOT NULL,
+    evidence_package_digest TEXT,
+    created_at             TEXT NOT NULL
+);
+
+-- Bindings from a joint task to the per-replica inspection records are
+-- append-only as well: a re-test inserts a new row and rows are never
+-- updated or deleted. A record referenced more than once stays on record;
+-- the joint evaluation marks the task inconclusive instead of rejecting
+-- the duplicate, so the attempt itself remains auditable.
+CREATE TABLE IF NOT EXISTS joint_inspection_bindings (
+    binding_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    joint_id      TEXT NOT NULL REFERENCES joint_inspections(joint_id),
+    inspection_id TEXT NOT NULL REFERENCES inspections(inspection_id),
+    replica_id    TEXT NOT NULL,
+    bound_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_joint_inspections_manifest
+    ON joint_inspections(manifest_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_joint_bindings_joint
+    ON joint_inspection_bindings(joint_id, binding_id);
 """
 
 
@@ -372,6 +409,71 @@ def list_inspections(conn: sqlite3.Connection,
     return list(conn.execute(
         "SELECT * FROM inspections WHERE manifest_id=? "
         "ORDER BY created_at, inspection_id", (manifest_id,)))
+
+
+# ---------------------------------------------- joint inspections (append-only)
+def insert_joint_inspection(conn: sqlite3.Connection, *, joint_id: str,
+                            manifest_id: str, media_id: str,
+                            replica_ids: list[str], seed: str,
+                            sample_ratio: float, window_start: str,
+                            window_end: str, plan: list[list[int]],
+                            chunk_boundaries: list[int],
+                            evidence_package_digest: Optional[str],
+                            created_at: str) -> None:
+    """Open one joint inspection task. The frozen plan (derived from the
+    unified seed at creation time) is stored alongside so the task stays
+    auditable even if the sampling algorithm ever changes."""
+    conn.execute(
+        """INSERT INTO joint_inspections (joint_id, manifest_id, media_id,
+                                          replica_ids_json, seed, sample_ratio,
+                                          window_start, window_end, plan_json,
+                                          chunk_boundaries_json,
+                                          evidence_package_digest, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (joint_id, manifest_id, media_id, canonical_json(replica_ids), seed,
+         sample_ratio, window_start, window_end, canonical_json(plan),
+         canonical_json(chunk_boundaries), evidence_package_digest,
+         created_at))
+
+
+def get_joint_inspection(conn: sqlite3.Connection, manifest_id: str,
+                         joint_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM joint_inspections WHERE manifest_id=? AND joint_id=?",
+        (manifest_id, joint_id)).fetchone()
+
+
+def get_joint_inspection_by_id(conn: sqlite3.Connection,
+                               joint_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM joint_inspections WHERE joint_id=?",
+                        (joint_id,)).fetchone()
+
+
+def list_joint_inspections(conn: sqlite3.Connection,
+                           manifest_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM joint_inspections WHERE manifest_id=? "
+        "ORDER BY created_at, joint_id", (manifest_id,)))
+
+
+def insert_joint_binding(conn: sqlite3.Connection, joint_id: str,
+                         inspection_id: str, replica_id: str,
+                         bound_at: str) -> None:
+    """Append one binding between a joint task and a submitted per-replica
+    inspection record. ``replica_id`` is denormalized from the inspection
+    record at bind time so the row stays self-contained."""
+    conn.execute(
+        """INSERT INTO joint_inspection_bindings (joint_id, inspection_id,
+                                                  replica_id, bound_at)
+           VALUES (?,?,?,?)""",
+        (joint_id, inspection_id, replica_id, bound_at))
+
+
+def list_joint_bindings(conn: sqlite3.Connection,
+                        joint_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM joint_inspection_bindings WHERE joint_id=? "
+        "ORDER BY binding_id", (joint_id,)))
 
 
 def dependency_db() -> Any:
