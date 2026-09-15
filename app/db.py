@@ -247,6 +247,52 @@ CREATE TABLE IF NOT EXISTS disclosure_proofs (
 
 CREATE INDEX IF NOT EXISTS idx_disclosure_proofs_manifest
     ON disclosure_proofs(manifest_id, created_at);
+
+-- Post-seal custody transfer proposals are append-only: a proposal freezes
+-- the sealed manifest, the evidence package digest, the replica, the chain
+-- head it extends, both parties, the location and the validity window; rows
+-- are never updated or deleted.
+CREATE TABLE IF NOT EXISTS custody_transfer_proposals (
+    proposal_id           TEXT PRIMARY KEY,
+    manifest_id           TEXT NOT NULL REFERENCES manifests(manifest_id),
+    media_id              TEXT NOT NULL,
+    replica_id            TEXT NOT NULL,
+    predecessor_head_id   TEXT NOT NULL,
+    predecessor_head_digest TEXT NOT NULL,
+    from_party            TEXT NOT NULL,
+    to_party              TEXT NOT NULL,
+    location              TEXT NOT NULL,
+    window_start          TEXT NOT NULL,
+    window_end            TEXT NOT NULL,
+    evidence_package_digest TEXT NOT NULL,
+    proposal_digest       TEXT NOT NULL,
+    record_json           TEXT NOT NULL,
+    created_at            TEXT NOT NULL
+);
+
+-- Transfer receipts are append-only attempts: every submitted receipt
+-- inserts a new row (a surrogate key allows even a duplicated receipt_id to
+-- stay on record), evaluated against the chain state at insertion time. An
+-- ineffective receipt mints no head; rows are never updated or deleted, so
+-- the rejection basis of every attempt survives.
+CREATE TABLE IF NOT EXISTS custody_transfer_receipts (
+    receipt_seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id   TEXT NOT NULL,
+    proposal_id  TEXT NOT NULL REFERENCES custody_transfer_proposals(proposal_id),
+    manifest_id  TEXT NOT NULL REFERENCES manifests(manifest_id),
+    replica_id   TEXT NOT NULL,
+    effective    INTEGER NOT NULL,
+    new_head_id  TEXT,
+    report_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_proposals_manifest
+    ON custody_transfer_proposals(manifest_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_transfer_receipts_manifest
+    ON custody_transfer_receipts(manifest_id, receipt_seq);
+CREATE INDEX IF NOT EXISTS idx_transfer_receipts_proposal
+    ON custody_transfer_receipts(proposal_id, receipt_seq);
 """
 
 
@@ -678,6 +724,92 @@ def list_disclosure_proofs(conn: sqlite3.Connection,
     return list(conn.execute(
         "SELECT * FROM disclosure_proofs WHERE manifest_id=? "
         "ORDER BY created_at, proof_id", (manifest_id,)))
+
+
+# ------------------------------------- custody transfers (append-only)
+def insert_transfer_proposal(conn: sqlite3.Connection,
+                             record: Any) -> None:
+    """Append one transfer proposal. ``record`` is a CustodyTransferProposal;
+    the fully frozen record (parties, window, anchored head, self digest) is
+    stored alongside the queryable columns and never re-derived."""
+    conn.execute(
+        """INSERT INTO custody_transfer_proposals
+               (proposal_id, manifest_id, media_id, replica_id,
+                predecessor_head_id, predecessor_head_digest,
+                from_party, to_party, location, window_start, window_end,
+                evidence_package_digest, proposal_digest, record_json,
+                created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (record.proposal_id, record.manifest_id, record.media_id,
+         record.replica_id, record.predecessor_head_id,
+         record.predecessor_head_digest, record.from_party, record.to_party,
+         record.location, record.window_start.isoformat(),
+         record.window_end.isoformat(), record.evidence_package_digest,
+         record.proposal_digest,
+         canonical_json(record.model_dump(mode="json")),
+         record.created_at.isoformat()))
+
+
+def get_transfer_proposal(conn: sqlite3.Connection, manifest_id: str,
+                          proposal_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM custody_transfer_proposals "
+        "WHERE manifest_id=? AND proposal_id=?",
+        (manifest_id, proposal_id)).fetchone()
+
+
+def get_transfer_proposal_by_id(conn: sqlite3.Connection,
+                                proposal_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM custody_transfer_proposals WHERE proposal_id=?",
+        (proposal_id,)).fetchone()
+
+
+def list_transfer_proposals(conn: sqlite3.Connection,
+                            manifest_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM custody_transfer_proposals WHERE manifest_id=? "
+        "ORDER BY created_at, proposal_id", (manifest_id,)))
+
+
+def insert_transfer_receipt(conn: sqlite3.Connection, report: Any) -> None:
+    """Append one receipt attempt (effective or not). The evaluated report —
+    including the minted head for an effective receipt and the rejection
+    findings otherwise — is frozen into report_json."""
+    conn.execute(
+        """INSERT INTO custody_transfer_receipts
+               (receipt_id, proposal_id, manifest_id, replica_id, effective,
+                new_head_id, report_json, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (report.receipt_id, report.proposal_id, report.manifest_id,
+         report.replica_id, int(report.effective),
+         report.new_head.head_id if report.new_head else None,
+         canonical_json(report.model_dump(mode="json")),
+         report.created_at.isoformat()))
+
+
+def list_transfer_receipts(conn: sqlite3.Connection,
+                           manifest_id: str) -> list[sqlite3.Row]:
+    """Every receipt attempt of a manifest, in append order (the order the
+    chain state was evaluated against)."""
+    return list(conn.execute(
+        "SELECT * FROM custody_transfer_receipts WHERE manifest_id=? "
+        "ORDER BY receipt_seq", (manifest_id,)))
+
+
+def list_transfer_receipts_for_proposal(conn: sqlite3.Connection,
+                                        proposal_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM custody_transfer_receipts WHERE proposal_id=? "
+        "ORDER BY receipt_seq", (proposal_id,)))
+
+
+def transfer_receipt_id_exists(conn: sqlite3.Connection,
+                               receipt_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM custody_transfer_receipts WHERE receipt_id=? LIMIT 1",
+        (receipt_id,)).fetchone()
+    return row is not None
 
 
 def dependency_db() -> Any:

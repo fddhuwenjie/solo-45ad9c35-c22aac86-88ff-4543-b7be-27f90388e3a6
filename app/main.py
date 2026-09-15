@@ -28,6 +28,8 @@ from .db import (
     get_repair_execution_by_id,
     get_repair_plan,
     get_repair_plan_by_id,
+    get_transfer_proposal,
+    get_transfer_proposal_by_id,
     insert_disclosure_proof,
     insert_inspection,
     insert_joint_binding,
@@ -35,6 +37,8 @@ from .db import (
     insert_manifest,
     insert_repair_execution,
     insert_repair_plan,
+    insert_transfer_proposal,
+    insert_transfer_receipt,
     list_disclosure_proofs,
     list_inspections,
     list_joint_bindings,
@@ -43,8 +47,12 @@ from .db import (
     list_repair_derived_replicas,
     list_repair_executions,
     list_repair_plans,
+    list_transfer_proposals,
+    list_transfer_receipts,
+    list_transfer_receipts_for_proposal,
     mark_sealed,
     save_precheck,
+    transfer_receipt_id_exists,
     utcnow_iso,
 )
 from .disclosure import (
@@ -71,6 +79,13 @@ from .joint import JointTaskContext, evaluate_joint_inspection
 from .recovery import analyze_recovery
 from .repair import evaluate_repair_execution, evaluate_repair_plan
 from .schemas import (
+    CustodyChainReport,
+    CustodyTransferPackage,
+    CustodyTransferProposal,
+    CustodyTransferProposalCreate,
+    CustodyTransferReceiptCreate,
+    CustodyTransferReceiptReport,
+    CustodyTransferSummary,
     DiffReport,
     DisclosureProof,
     DisclosureProofCreate,
@@ -101,6 +116,15 @@ from .schemas import (
     SealRejected,
     SealResult,
     Severity,
+)
+from .transfer import (
+    build_chains,
+    build_transfer_package,
+    chain_views,
+    evaluate_receipt,
+    genesis_heads,
+    proposal_digest,
+    transfer_status,
 )
 from .verifier import evaluate
 
@@ -156,7 +180,13 @@ app = FastAPI(
         "the sealed Merkle root (leaf index, sibling digests and odd-node "
         "promotions), selected by chunk id or by ranges aligned exactly with "
         "effective chunk boundaries, with an append-only issuance record and "
-        "a stateless recomputation endpoint."
+        "a stateless recomputation endpoint. Post-seal custody transfers "
+        "continue the frozen custody chain: a proposal cites the sealed "
+        "manifest, the evidence package digest, the replica and the live "
+        "chain head (parties, location, validity window), and the receiver's "
+        "receipt binds the in-window passing inspections; an effective "
+        "receipt mints the next hash-linked chain head while every rejected "
+        "attempt stays on the append-only record with its rejection basis."
     ),
     lifespan=lifespan,
 )
@@ -407,7 +437,8 @@ def evidence_package(manifest_id: str, conn: sqlite3.Connection = Depends(get_db
 
 
 # ------------------------------------- post-seal integrity inspection ----
-def _sealed_context(conn: sqlite3.Connection, manifest_id: str):
+def _sealed_context(conn: sqlite3.Connection, manifest_id: str,
+                    code: str = "INSPECTION_REQUIRES_SEALED"):
     """Load a sealed manifest plus its sealed report and bound package digest.
 
     Inspections patrol the copies of a *sealed* image; a draft or superseded
@@ -418,9 +449,10 @@ def _sealed_context(conn: sqlite3.Connection, manifest_id: str):
         raise HTTPException(404, f"manifest {manifest_id} not found")
     if row["status"] != "sealed":
         raise HTTPException(409, detail={
-            "code": "INSPECTION_REQUIRES_SEALED",
-            "message": "integrity inspections reference the sealed manifest; "
-                       f"manifest {manifest_id} is '{row['status']}'",
+            "code": code,
+            "message": "this post-seal operation references the sealed "
+                       f"manifest; manifest {manifest_id} is "
+                       f"'{row['status']}'",
             "status": row["status"]})
     sealed_report = report_from_json(row["seal_report_json"])
     sealed_payload = payload_from_row(row)
@@ -1133,6 +1165,233 @@ def verify_disclosure_proof(payload: DisclosureVerifyRequest):
     ``valid=false`` with an explicit error code.
     """
     return evaluate_verification(payload)
+
+
+# --------------------- post-seal custody transfer continuation (append-only)
+def _stored_transfer_proposal(row: sqlite3.Row) -> CustodyTransferProposal:
+    return CustodyTransferProposal.model_validate(json.loads(row["record_json"]))
+
+
+def _stored_transfer_receipt(row: sqlite3.Row) -> CustodyTransferReceiptReport:
+    return CustodyTransferReceiptReport.model_validate(
+        json.loads(row["report_json"]))
+
+
+def _transfer_chain_state(conn: sqlite3.Connection, manifest_id: str):
+    """Sealed context plus the live post-seal custody chain state.
+
+    The genesis heads are derived from the sealed manifest's frozen custody
+    events; the effective receipt records (append-only, in insertion order)
+    extend them. Returns everything the transfer endpoints need: the sealed
+    context, the per-replica chains and the stored receipt reports.
+    """
+    row, sealed_payload, sealed_report, package_digest_ = _sealed_context(
+        conn, manifest_id, code="TRANSFER_REQUIRES_SEALED")
+    genesis = genesis_heads(
+        sealed_payload, manifest_id=manifest_id,
+        evidence_package_digest=package_digest_,
+        image_sha256=sealed_report.reconstructed_sha256,
+        created_at=row["sealed_at"])
+    receipts = [_stored_transfer_receipt(r)
+                for r in list_transfer_receipts(conn, manifest_id)]
+    chains = build_chains(genesis, receipts)
+    return row, sealed_payload, sealed_report, package_digest_, receipts, chains
+
+
+def _transfer_summary(proposal: CustodyTransferProposal,
+                      receipts: list[CustodyTransferReceiptReport]
+                      ) -> CustodyTransferSummary:
+    new_head_id = next((r.new_head.head_id for r in receipts
+                        if r.effective and r.new_head is not None), None)
+    return CustodyTransferSummary(
+        proposal_id=proposal.proposal_id, replica_id=proposal.replica_id,
+        from_party=proposal.from_party, to_party=proposal.to_party,
+        location=proposal.location, window_start=proposal.window_start,
+        window_end=proposal.window_end, status=transfer_status(receipts),
+        receipt_count=len(receipts), new_head_id=new_head_id,
+        created_at=proposal.created_at)
+
+
+@app.post("/manifests/{manifest_id}/custody-transfers",
+          response_model=CustodyTransferProposal, status_code=201)
+def create_transfer_proposal(manifest_id: str,
+                             payload: CustodyTransferProposalCreate,
+                             conn: sqlite3.Connection = Depends(get_db)):
+    """Open a post-seal custody transfer proposal (append-only).
+
+    The proposal cites the sealed manifest, the exact
+    ``evidence_package_digest``, the replica and the CURRENT custody chain
+    head it extends, and freezes the handing-over party, the receiving
+    party, the location and the validity window. The receiver answers with a
+    receipt via ``POST .../custody-transfers/{proposal_id}/receipts``. A
+    proposal anchored to a head that another effective transfer already
+    consumed is refused (the chain never forks); an existing proposal_id is
+    never rewritten (409).
+    """
+    row, sealed_payload, sealed_report, package_digest_, receipts, chains = \
+        _transfer_chain_state(conn, manifest_id)
+    if get_transfer_proposal_by_id(conn, payload.proposal_id) is not None:
+        raise HTTPException(409, detail={
+            "code": "TRANSFER_PROPOSAL_DUPLICATE",
+            "message": f"transfer proposal {payload.proposal_id} already "
+                       "exists; proposals are append-only and a changed "
+                       "offer must use a new proposal_id",
+            "proposal_id": payload.proposal_id})
+    if payload.evidence_package_digest != package_digest_:
+        raise HTTPException(422, detail={
+            "code": "TRANSFER_EVIDENCE_PACKAGE_MISMATCH",
+            "message": "the cited evidence_package_digest does not match the "
+                       "digest of the sealed evidence package; a transfer "
+                       "can only continue the chain of the sealed image",
+            "submitted_digest": payload.evidence_package_digest,
+            "sealed_digest": package_digest_})
+    if payload.replica_id not in chains:
+        raise HTTPException(422, detail={
+            "code": "TRANSFER_REPLICA_UNKNOWN",
+            "message": f"replica {payload.replica_id} is not registered in "
+                       "the sealed manifest; only sealed replicas carry a "
+                       "custody chain that can be continued",
+            "replica_id": payload.replica_id})
+    heads = chains[payload.replica_id]
+    known_head_ids = {h.head_id for h in heads}
+    if payload.predecessor_head_id not in known_head_ids:
+        raise HTTPException(422, detail={
+            "code": "TRANSFER_HEAD_UNKNOWN",
+            "message": f"chain head {payload.predecessor_head_id} is not on "
+                       f"the custody chain of replica {payload.replica_id}; "
+                       "query GET /manifests/{id}/custody-chain for the "
+                       "live head",
+            "replica_id": payload.replica_id,
+            "predecessor_head_id": payload.predecessor_head_id})
+    tip = heads[-1]
+    if payload.predecessor_head_id != tip.head_id:
+        raise HTTPException(409, detail={
+            "code": "TRANSFER_HEAD_OCCUPIED",
+            "message": f"chain head {payload.predecessor_head_id} of replica "
+                       f"{payload.replica_id} was already consumed by an "
+                       f"effective transfer; the live head is {tip.head_id} "
+                       "and the custody chain does not fork",
+            "replica_id": payload.replica_id,
+            "predecessor_head_id": payload.predecessor_head_id,
+            "live_head_id": tip.head_id})
+    record = CustodyTransferProposal(
+        proposal_id=payload.proposal_id, manifest_id=manifest_id,
+        media_id=row["media_id"], replica_id=payload.replica_id,
+        evidence_package_digest=payload.evidence_package_digest,
+        predecessor_head_id=tip.head_id,
+        predecessor_head_digest=tip.head_digest,
+        from_party=payload.from_party, to_party=payload.to_party,
+        location=payload.location, window_start=payload.window_start,
+        window_end=payload.window_end, note=payload.note,
+        created_at=utcnow_iso())
+    record.proposal_digest = proposal_digest(record)
+    insert_transfer_proposal(conn, record)
+    return record
+
+
+@app.get("/manifests/{manifest_id}/custody-transfers",
+         response_model=list[CustodyTransferSummary])
+def list_manifest_transfer_proposals(
+        manifest_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    """List every transfer proposal of the manifest with its rolled-up
+    receipt status (pending / completed / rejected)."""
+    if get_manifest(conn, manifest_id) is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    out: list[CustodyTransferSummary] = []
+    for prow in list_transfer_proposals(conn, manifest_id):
+        proposal = _stored_transfer_proposal(prow)
+        receipts = [_stored_transfer_receipt(r)
+                    for r in list_transfer_receipts_for_proposal(
+                        conn, proposal.proposal_id)]
+        out.append(_transfer_summary(proposal, receipts))
+    return out
+
+
+@app.get("/manifests/{manifest_id}/custody-transfers/{proposal_id}",
+         response_model=CustodyTransferPackage)
+def read_transfer_proposal(manifest_id: str, proposal_id: str,
+                           conn: sqlite3.Connection = Depends(get_db)):
+    """The full JSON transfer package: the frozen proposal, every receipt
+    attempt with its rejection basis, the resolved inspection references and
+    the minted chain head of an effective transfer, self-digested so any
+    party can recompute it."""
+    prow = get_transfer_proposal(conn, manifest_id, proposal_id)
+    if prow is None:
+        raise HTTPException(404, f"transfer proposal {proposal_id} not found "
+                                 f"for manifest {manifest_id}")
+    proposal = _stored_transfer_proposal(prow)
+    receipts = [_stored_transfer_receipt(r)
+                for r in list_transfer_receipts_for_proposal(conn, proposal_id)]
+    return build_transfer_package(proposal, media_id=prow["media_id"],
+                                  receipts=receipts)
+
+
+@app.post("/manifests/{manifest_id}/custody-transfers/{proposal_id}/receipts",
+          response_model=CustodyTransferReceiptReport, status_code=201)
+def create_transfer_receipt(manifest_id: str, proposal_id: str,
+                            payload: CustodyTransferReceiptCreate,
+                            conn: sqlite3.Connection = Depends(get_db)):
+    """Submit the receiver's receipt for a transfer proposal (append-only).
+
+    The receipt binds the inspection records of the transferred replica
+    completed inside the proposal's validity window. The service checks both
+    party identities against the proposal, the uniqueness of the predecessor
+    head (a parallel transfer that consumed the head first wins), the
+    attribution and conclusion of every bound inspection, digest continuity
+    and time ordering. An effective receipt mints the next chain head with a
+    hash link to its predecessor. An expired window, a duplicate receipt, an
+    occupied head, a failed/inconclusive inspection or a package digest
+    mismatch leave the transfer without effect — the attempt is appended to
+    the record all the same, with the rejection basis in its findings.
+    """
+    row, sealed_payload, sealed_report, package_digest_, receipts, chains = \
+        _transfer_chain_state(conn, manifest_id)
+    prow = get_transfer_proposal(conn, manifest_id, proposal_id)
+    if prow is None:
+        raise HTTPException(404, detail={
+            "code": "TRANSFER_PROPOSAL_UNKNOWN",
+            "message": f"transfer proposal {proposal_id} not found for "
+                       f"manifest {manifest_id}; open the proposal first",
+            "proposal_id": proposal_id})
+    proposal = _stored_transfer_proposal(prow)
+    inspections = {r.inspection_id: r for r in
+                   (_stored_inspection_report(i)
+                    for i in list_inspections(conn, manifest_id))}
+    report = evaluate_receipt(
+        payload, proposal=proposal, media_id=row["media_id"],
+        current_tip=chains[proposal.replica_id][-1],
+        sealed_package_digest=package_digest_,
+        image_sha256=sealed_report.reconstructed_sha256,
+        inspections=inspections,
+        receipt_id_seen=transfer_receipt_id_exists(conn, payload.receipt_id),
+        proposal_fulfilled=any(r.effective and r.proposal_id == proposal_id
+                               for r in receipts),
+        created_at=utcnow_iso())
+    insert_transfer_receipt(conn, report)
+    return report
+
+
+@app.get("/manifests/{manifest_id}/custody-chain",
+         response_model=CustodyChainReport)
+def read_custody_chain(manifest_id: str,
+                       conn: sqlite3.Connection = Depends(get_db)):
+    """Current post-seal custody chain state of a sealed manifest.
+
+    Per replica: the genesis head derived from the sealed custody events,
+    every head minted by an effective transfer in hash-linked order, and the
+    live tip a new transfer proposal must cite. The sealed manifest's own
+    custody_events keep being read by the original logic; this chain only
+    continues them.
+    """
+    row, sealed_payload, sealed_report, package_digest_, receipts, chains = \
+        _transfer_chain_state(conn, manifest_id)
+    genesis = {rid: heads[0] for rid, heads in chains.items()}
+    return CustodyChainReport(
+        manifest_id=manifest_id, media_id=row["media_id"],
+        evidence_package_digest=package_digest_,
+        image_sha256=sealed_report.reconstructed_sha256,
+        merkle_root=sealed_report.merkle_root,
+        replicas=chain_views(genesis, receipts))
 
 
 @app.get("/media/{media_id}", response_model=MediaRecord)

@@ -1327,3 +1327,261 @@ class DisclosureVerifyResult(ForensicModel):
     recomputed_root: Optional[str] = None
     error_code: Optional[str] = None
     error: Optional[str] = None
+
+
+# ------------------------------------- post-seal custody transfer ----
+# The custody_events frozen into a sealed manifest end at the sealing-time
+# hand-over; a copy handed over again afterwards has no continuation entry,
+# and two transfers initiated in parallel by the same holder would fork the
+# custody chain. A transfer proposal therefore cites the sealed manifest,
+# the evidence package digest, the replica and the CURRENT custody chain
+# head it extends, and names the handing-over party, the receiving party,
+# the location and the validity window. The receiver answers with a receipt
+# binding the inspections of that replica completed inside the window. The
+# service checks both party identities, the uniqueness of the predecessor
+# head, the attribution and conclusion of every bound inspection, digest
+# continuity and time ordering; an effective receipt mints the next chain
+# head with a hash link to its predecessor. Every attempt is appended to
+# the record even when the transfer does not take effect, so the rejection
+# basis stays auditable.
+
+
+class CustodyTransferProposalCreate(ForensicModel):
+    """Open a post-seal custody transfer proposal on a sealed manifest."""
+
+    proposal_id: str = Field(min_length=1,
+                             description="Unique id; proposals are append-only "
+                                         "and an existing id is never rewritten")
+    evidence_package_digest: str = Field(
+        pattern=HEX64,
+        description="Digest of the sealed evidence package the transfer is "
+                    "bound to")
+    replica_id: str = Field(min_length=1,
+                            description="Replica (from the sealed manifest) "
+                                        "being handed over")
+    predecessor_head_id: str = Field(
+        min_length=1,
+        description="Current custody chain head this proposal extends; the "
+                    "chain advances only from the live tip, so a parallel "
+                    "proposal consuming the same head first wins")
+    from_party: str = Field(min_length=1,
+                            description="Handing-over party (current custodian)")
+    to_party: str = Field(min_length=1,
+                          description="Receiving party (next custodian)")
+    location: str = Field(min_length=1,
+                          description="Hand-over location frozen into the record")
+    window_start: datetime = Field(
+        description="Start of the validity window (inclusive); the receipt "
+                    "and its bound inspections must fall inside the window")
+    window_end: datetime = Field(
+        description="End of the validity window (inclusive)")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "CustodyTransferProposalCreate":
+        if self.window_end <= self.window_start:
+            raise ValueError("window_end must be after window_start")
+        if self.from_party.strip() == self.to_party.strip():
+            raise ValueError("from_party and to_party must differ")
+        return self
+
+
+class CustodyChainHead(ForensicModel):
+    """One custody chain head: the sealed terminal event (genesis) or the
+    head minted by an effective transfer receipt, hash-linked to its
+    predecessor."""
+
+    head_id: str
+    manifest_id: str
+    replica_id: str
+    source: Literal["sealed", "transfer"]
+    predecessor_head_id: Optional[str] = None
+    predecessor_head_digest: Optional[str] = None
+    head_digest: str = Field(description="SHA-256 hash link over the head "
+                                         "record and its predecessor digest")
+    custodian: Optional[str] = Field(
+        None, description="Party holding the replica after this head")
+    terminal_event_id: Optional[str] = Field(
+        None, description="Sealed custody event a genesis head is derived from")
+    proposal_id: Optional[str] = None
+    receipt_id: Optional[str] = None
+    evidence_package_digest: Optional[str] = None
+    image_sha256: Optional[str] = None
+    at: Optional[datetime] = Field(
+        None, description="Sealed event time / declared hand-over moment")
+    created_at: datetime
+
+
+class CustodyTransferProposal(ForensicModel):
+    """Stored transfer proposal record (append-only)."""
+
+    proposal_id: str
+    manifest_id: str
+    media_id: str
+    replica_id: str
+    evidence_package_digest: str
+    predecessor_head_id: str
+    predecessor_head_digest: str = Field(
+        description="Hash link of the chain head the proposal was anchored "
+                    "to at creation time")
+    from_party: str
+    to_party: str
+    location: str
+    window_start: datetime
+    window_end: datetime
+    note: Optional[str] = None
+    proposal_digest: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="SHA-256 over the canonical proposal record without this "
+                    "field")
+    created_at: datetime
+
+
+class CustodyTransferReceiptCreate(ForensicModel):
+    """Receiver's receipt answering a transfer proposal (append-only)."""
+
+    receipt_id: str = Field(min_length=1,
+                            description="Unique id; every receipt attempt is "
+                                        "appended to the record, even one "
+                                        "that does not take effect")
+    evidence_package_digest: str = Field(
+        pattern=HEX64,
+        description="Sealed evidence package digest the receiver verified "
+                    "against; must equal the digest frozen at sealing time")
+    handed_over_by: str = Field(min_length=1,
+                                description="Handing-over party; must equal "
+                                            "the proposal's from_party")
+    received_by: str = Field(min_length=1,
+                             description="Receiving party; must equal the "
+                                         "proposal's to_party")
+    received_at: datetime = Field(
+        description="Declared hand-over moment; must fall inside the "
+                    "proposal's validity window")
+    location: Optional[str] = Field(
+        None, description="Actual hand-over location, if it differs from the "
+                          "proposed one (recorded for the audit trail)")
+    inspection_ids: list[str] = Field(
+        min_length=1,
+        description="Inspection records of this replica completed inside the "
+                    "validity window; every one must belong to the "
+                    "transferred replica and must have concluded 'passed'")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "CustodyTransferReceiptCreate":
+        if any(not iid or not iid.strip() for iid in self.inspection_ids):
+            raise ValueError("inspection_ids must not contain empty identifiers")
+        if len(set(self.inspection_ids)) != len(self.inspection_ids):
+            raise ValueError("inspection_ids must not contain duplicates")
+        return self
+
+
+class CustodyTransferInspectionRef(ForensicModel):
+    """Resolved reference to one inspection record bound by a receipt, with
+    the checks the service applied to it."""
+
+    inspection_id: str
+    replica_id: Optional[str] = None
+    result: Optional[str] = None
+    seed: Optional[str] = None
+    sample_ratio: Optional[float] = None
+    first_read_at: Optional[datetime] = None
+    last_read_at: Optional[datetime] = None
+    verified_sectors: Optional[int] = None
+    attribution_ok: bool = Field(
+        description="The inspection belongs to the transferred replica of "
+                    "the sealed manifest")
+    conclusion_ok: bool = Field(
+        description="The inspection concluded 'passed' (not "
+                    "failed/inconclusive)")
+    within_window: bool = Field(
+        description="Every reading was taken inside the proposal's validity "
+                    "window")
+
+
+class CustodyTransferReceiptReport(ForensicModel):
+    """Evaluation of one receipt attempt. The attempt is always appended to
+    the record; ``effective`` tells whether the transfer took effect and a
+    new chain head was minted. When not effective, ``findings`` carry the
+    rejection basis."""
+
+    receipt_id: str
+    proposal_id: str
+    manifest_id: str
+    media_id: str
+    replica_id: str
+    effective: bool
+    handed_over_by: str
+    received_by: str
+    received_at: datetime
+    location: Optional[str] = None
+    evidence_package_digest: str
+    inspection_ids: list[str] = Field(default_factory=list)
+    inspection_refs: list[CustodyTransferInspectionRef] = Field(
+        default_factory=list)
+    new_head: Optional[CustodyChainHead] = Field(
+        None, description="Minted only when the receipt is effective")
+    findings: list[Finding] = Field(default_factory=list)
+    created_at: datetime
+
+
+class CustodyTransferSummary(ForensicModel):
+    proposal_id: str
+    replica_id: str
+    from_party: str
+    to_party: str
+    location: str
+    window_start: datetime
+    window_end: datetime
+    status: Literal["pending", "completed", "rejected"]
+    receipt_count: int
+    new_head_id: Optional[str] = None
+    created_at: datetime
+
+
+TRANSFER_PACKAGE_FORMAT = "split-image-custody-transfer/v1"
+
+
+class CustodyTransferPackage(ForensicModel):
+    """Self-describing JSON transfer package: restores the proposal, every
+    receipt attempt, the bound inspection references and the rejection basis
+    of any ineffective attempt."""
+
+    format: Literal[TRANSFER_PACKAGE_FORMAT] = TRANSFER_PACKAGE_FORMAT
+    manifest_id: str
+    media_id: str
+    replica_id: str
+    evidence_package_digest: str
+    status: Literal["pending", "completed", "rejected"]
+    proposal: CustodyTransferProposal
+    receipts: list[CustodyTransferReceiptReport] = Field(default_factory=list)
+    inspection_refs: list[CustodyTransferInspectionRef] = Field(
+        default_factory=list)
+    new_head: Optional[CustodyChainHead] = None
+    transfer_package_digest: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="SHA-256 over canonical JSON of the package with this "
+                    "field removed")
+
+
+class CustodyChainReplicaView(ForensicModel):
+    """Post-seal custody chain of one replica: the genesis head derived from
+    the sealed custody events plus every head minted by an effective
+    transfer, in hash-linked order."""
+
+    replica_id: str
+    heads: list[CustodyChainHead] = Field(default_factory=list)
+    current_head_id: str
+    current_head_digest: str
+    current_custodian: Optional[str] = None
+
+
+class CustodyChainReport(ForensicModel):
+    """Current post-seal custody chain state of a sealed manifest."""
+
+    manifest_id: str
+    media_id: str
+    evidence_package_digest: Optional[str] = None
+    image_sha256: Optional[str] = None
+    merkle_root: Optional[str] = None
+    replicas: list[CustodyChainReplicaView] = Field(default_factory=list)
