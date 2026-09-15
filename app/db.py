@@ -225,6 +225,28 @@ CREATE INDEX IF NOT EXISTS idx_repair_plans_manifest
     ON repair_plans(manifest_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_repair_executions_plan
     ON repair_executions(plan_id, created_at);
+
+-- Selective disclosure proofs are append-only: every issuance freezes the
+-- sealed manifest revision, the evidence package digest, the exact request
+-- scope (chunk ids / sector ranges / requester / reason), the covered
+-- ranges and the self-digested proof; rows are never updated or deleted, so
+-- a later re-request cannot hide what was disclosed earlier.
+CREATE TABLE IF NOT EXISTS disclosure_proofs (
+    proof_id      TEXT PRIMARY KEY,
+    manifest_id   TEXT NOT NULL REFERENCES manifests(manifest_id),
+    media_id      TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    requested_by  TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    request_json  TEXT NOT NULL,
+    covered_json  TEXT NOT NULL,
+    proof_json    TEXT NOT NULL,
+    disclosure_digest TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_disclosure_proofs_manifest
+    ON disclosure_proofs(manifest_id, created_at);
 """
 
 
@@ -624,6 +646,38 @@ def list_repair_derived_replicas(conn: sqlite3.Connection,
     return list(conn.execute(
         "SELECT * FROM repair_derived_replicas WHERE manifest_id=? "
         "ORDER BY registered_at, replica_id", (manifest_id,)))
+
+
+# ----------------------------------------- selective disclosure (append-only)
+def insert_disclosure_proof(conn: sqlite3.Connection, report: Any,
+                            request: Any) -> None:
+    """Append one selective disclosure proof with the exact request scope
+    and the covered ranges. Proof rows are never updated or deleted."""
+    conn.execute(
+        """INSERT INTO disclosure_proofs (proof_id, manifest_id, media_id,
+                                          revision, requested_by, reason,
+                                          request_json, covered_json, proof_json,
+                                          disclosure_digest, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (report.proof_id, report.manifest_id, report.media_id, report.revision,
+         request.requested_by, request.reason,
+         canonical_json(request.model_dump(mode="json")),
+         canonical_json([iv.model_dump() for iv in report.covered_sector_ranges]),
+         canonical_json(report.model_dump(mode="json")),
+         report.disclosure_digest, report.created_at.isoformat()))
+
+
+def get_disclosure_proof_by_id(conn: sqlite3.Connection,
+                               proof_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM disclosure_proofs WHERE proof_id=?",
+                        (proof_id,)).fetchone()
+
+
+def list_disclosure_proofs(conn: sqlite3.Connection,
+                           manifest_id: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM disclosure_proofs WHERE manifest_id=? "
+        "ORDER BY created_at, proof_id", (manifest_id,)))
 
 
 def dependency_db() -> Any:

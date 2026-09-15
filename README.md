@@ -173,6 +173,71 @@ ID，永不覆盖失败结果。`GET /manifests/{id}/inspection-report` 汇总�
 摘要取自各巡检记录封存时冻结的结果，不在报告时重算，历史不会随证据库
 状态漂移。
 
+## 选择性披露证明（只追加）
+
+法庭或外部复核方往往只需核验**几个关键分块**，不应为此取得整盘镜像；
+而现有证据包只能整包复算，无法证明单独交付的分块属于封存时的 Merkle
+根。本服务对 **sealed** 清单签发**选择性披露证明**，把逐块交付的叶子
+锚定到封存根：
+
+1. `POST /manifests/{id}/disclosure-proofs` 请求必须引用 sealed 清单并
+   携带封存证据包的精确 `evidence_package_digest`，按 `chunk_ids` 和/或
+   与**有效分块边界完全对齐**的 `sector_ranges`（半开 `[start,end)`）选择
+   待披露叶子。每个证明有全局唯一 `proof_id`，重复返回 409（只追加，重开
+   必须换新 ID）。
+2. 服务为每个披露叶子生成：零基**叶序号 `leaf_index`**、逐层的
+   **左右兄弟摘要**（`left`/`right` + `sibling_digest`）和**奇节点提升
+   步骤**（`promoted`，无兄弟、节点原样上提），每步还带本步重组结果
+   `result_digest`，任一步被篡改当场可辨。
+3. 请求范围（`chunk_ids`/`sector_ranges`/`requested_by`/`reason`）、叶子
+   实际覆盖的合并扇区区间 `covered_sector_ranges` 和每叶的
+   `selection_rationale`（被哪个选择器选中、与哪条有效边界对齐）全部
+   冻结进只追加记录；证明本身再对"去掉 `disclosure_digest` 的自身"做
+   规范 JSON SHA-256。
+4. 证明 JSON **固定**封存修订号（`revision`）、证据包摘要、完整的
+   Merkle 算法说明 `merkle_spec` 和**采用的叶序** `leaf_ordering_rule`
+   （封存清单 `ordered_chunk_ids` 的有效块序；纠错已取代块不是叶子），
+   并给出全部叶子的 ID/扇区跨度（`ordered_leaves`，不泄露未披露叶子的
+   摘要）。
+
+下列情况**一律拒绝签发**（4xx，不留任何记录）：
+
+- `DISCLOSURE_REQUIRES_SEALED`（409）：清单不是 sealed；
+- `DISCLOSURE_EVIDENCE_PACKAGE_MISMATCH`（422）：证据包摘要与封存时
+  冻结值不符（错误详情同时给出密封端摘要）；
+- `DISCLOSURE_CHUNK_NOT_FOUND`：`chunk_id` 不在封存清单中；
+- `DISCLOSURE_CHUNK_SUPERSEDED`：该块已被 `correction_of` 纠错块取代、
+  不是封存 Merkle 树的叶子（返回可披露的 `effective_chunk_ids`）；
+- `DISCLOSURE_RANGE_NOT_ALIGNED`：扇区区间跨分块边界、只覆盖块的一部分
+  或落在覆盖缝隙（错误详情返回 `valid_boundaries` 供对齐）；
+- `DISCLOSURE_RANGE_OUT_OF_BOUNDS`：区间超出介质总扇区数；
+- `DISCLOSURE_DUPLICATE_LEAF`：同一叶子被多个选择器（chunk_id 与区间、
+  或交叠区间）重复选中；请求体内重复/交叠的 `chunk_ids`/`sector_ranges`
+  由请求模式直接拒绝；空选择同样拒绝。
+
+### 仅凭叶摘要与路径的无状态复核
+
+`POST /disclosure/verify` **只凭**叶摘要、证明路径和复核方持有的冻结根
+复算，不读取任何清单、证据包、数据库或分块字节：
+
+- 按 `leaf_index` 与逐级节点数核验每步位置（奇索引必为 `right`、偶数
+  非末位必为 `left`、末位单数必为 `promoted`）、层级连续、兄弟有无与
+  兄弟摘要格式，再按封存的同一规则
+  `sha256(left_bytes || right_bytes)` 重组，逐层比对 `result_digest`；
+- 路径必须**闭合到唯一根**：路径过短（未闭合
+  `DISCLOSURE_PATH_NOT_CLOSED`）、多余步骤、层级错位
+  （`DISCLOSURE_STEP_LEVEL_MISMATCH`）、位置/兄弟不合法
+  （`DISCLOSURE_STEP_POSITION_MISMATCH`）、重组摘要不符
+  （`DISCLOSURE_STEP_DIGEST_MISMATCH`）或最终根不同
+  （`DISCLOSURE_ROOT_MISMATCH`）都返回 `valid=false`；
+- 单叶树路径为空：叶摘要即根，根不同则 `DISCLOSURE_ROOT_MISMATCH`。
+
+`GET /manifests/{id}/disclosure-proofs` 列出该清单全部签发记录摘要
+（披露块、覆盖区间、请求人/理由、自摘要、时间）；
+`GET /manifests/{id}/disclosure-proofs/{proof_id}` 取回完整证明 JSON。
+证明记录只追加：行永不更新或删除，旧证明不会被重开覆盖。旧 SHA-256/
+Merkle 规则与既有接口保持不变。
+
 ### 关键算法
 
 - **覆盖重建**：把每块 `(offset, length)` 换算为扇区区间，扫描线合并，
@@ -226,6 +291,10 @@ ID，永不覆盖失败结果。`GET /manifests/{id}/inspection-report` 汇总�
 | `GET  /manifests/{id}/joint-inspections` | 列出该清单全部联合巡检任务摘要 |
 | `GET  /manifests/{id}/joint-inspections/{joint_id}` | 联合报告：逐区间联合判定、逐副本覆盖、差异首次出现时间、绑定原巡检记录 |
 | `POST /manifests/{id}/joint-inspections/{joint_id}/submissions` | 把单副本巡检记录绑定到联合任务（只追加，201 返回最新联合报告） |
+| `POST /manifests/{id}/disclosure-proofs` | 签发选择性披露证明（引用 sealed 清单与 `evidence_package_digest`，按 chunk_id 或与有效分块边界完全对齐的扇区区间选择；为每叶给叶序号、左右兄弟摘要与奇节点提升步骤；只追加，重复 ID 409；取代块/越界/跨边界/重复叶/摘要不符一律 4xx 不签发） |
+| `GET  /manifests/{id}/disclosure-proofs` | 列出该清单全部披露证明摘要（请求人/理由、披露块、覆盖区间、自摘要） |
+| `GET  /manifests/{id}/disclosure-proofs/{proof_id}` | 读取完整披露证明 JSON（固定修订号、算法说明与叶序） |
+| `POST /disclosure/verify` | **无状态**：仅凭叶摘要、证明路径和冻结根复算；不闭合或根不同返回 `valid=false` 与错误码 |
 | `GET  /diffs?left=&right=` | 两个修订版本比较（参数变化、增删块/会话/副本/事件、根差异） |
 | `GET  /media/{media_id}` | 介质登记（参数在首次登记时冻结） |
 | `GET  /health` | 健康检查 |
@@ -276,14 +345,17 @@ EVIDENCE_ROOTS=/var/evidence:/mnt/raid/acquisitions \
 测试：
 
 ```bash
-pytest -q          # 104 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
+pytest -q          # 143 个用例：覆盖、重叠、错序、纠错、换盘、交接断链、
                    # 文件型分块读取/缺件/截断/错序拼接、零副本零事件、证据包复算、
                    # 坏扇区重试合并/填充溯源/稀疏洞/人工例外/冻结策略/封存原子性、
                    # 封存后巡检抽样计划/漏检/重复/越界/摘要冲突/读取失败/
                    # 副本链断裂/只追加历史与首次变化时间、
                    # 多副本联合巡检（全部一致/单副本偏离/多副本共同偏离/缺读/
                    # 基准不可复算不改判通过/缺席/越窗/区间不齐/重复引用/
-                   # 补测只追加且首次差异时间保留）
+                   # 补测只追加且首次差异时间保留）、
+                   # 选择性披露证明（叶序号/兄弟摘要/奇节点提升、边界对齐扇区
+                   # 区间、纠错取代块不可披露、重复叶/摘要不符拒绝签发、
+                   # 只追加记录、无状态复算拒绝篡改/截短/越层/不闭合路径）
 ```
 
 ### 请求示例（片段）
@@ -332,6 +404,41 @@ pytest -q          # 104 个用例：覆盖、重叠、错序、纠错、换盘�
 }
 ```
 
+选择性披露请求示例（`POST /manifests/{id}/disclosure-proofs`；扇区区间
+必须与有效分块边界完全对齐）：
+
+```json
+{
+  "proof_id": "DP-2026-10-15-01",
+  "evidence_package_digest": "<封存证据包的 evidence_package_digest>",
+  "chunk_ids": ["C02"],
+  "sector_ranges": [{"start_sector": 32, "end_sector": 48}],
+  "requested_by": "court-01/zhang.fa",
+  "reason": "庭审质证第 3、4 分块"
+}
+```
+
+签发的每个叶子带 `leaf_index` 与逐层路径，外部只凭叶摘要、路径和冻结根
+POST 到 `/disclosure/verify` 即可复算（不依赖证据包或数据库）：
+
+```json
+{
+  "merkle_root": "<封存 Merkle 根>",
+  "leaf_index": 1, "leaf_count": 4,
+  "leaf_digest": "<交付分块的 SHA-256>",
+  "proof_steps": [
+    {"level": 0, "position": "right",
+     "sibling_digest": "<左兄弟摘要>", "result_digest": "<本步重组结果>"},
+    {"level": 1, "position": "left",
+     "sibling_digest": "<右兄弟摘要>", "result_digest": "<= merkle_root>"}
+  ]
+}
+```
+
+奇数叶层末位叶子对应 `"position": "promoted"`（无 `sibling_digest`，
+节点原样上提）；单叶树路径为空。篡改叶摘要/兄弟/位置、路径未闭合或根不
+符一律 `valid=false`。
+
 ## 目录结构
 
 ```
@@ -345,10 +452,13 @@ app/
   evidence.py   证据包构造、修订比较
   inspection.py 封存后巡检：种子确定性抽样计划、逐段比对、只追加历史聚合
   joint.py      多副本联合巡检：冻结任务上下文、逐区间跨副本判定、只追加绑定聚合
-  db.py         SQLite 建表、事务化修订写入、封存/预检/巡检/联合巡检持久化
+  repair.py     修复计划与执行：捐赠方优先级与同区间封存基准匹配、逐间隔写入核验、派生副本登记
+  disclosure.py 选择性披露证明：叶序冻结、边界对齐选择、含奇节点提升的 Merkle 包含路径、
+                  无状态路径闭合复算
+  db.py         SQLite 建表、事务化修订写入、封存/预检/巡检/联合巡检/修复/披露证明持久化
   main.py       FastAPI 路由
-tests/          104 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块、
+tests/          143 个端到端与单元测试（合成 32KiB 介质、两段断电采集、文件型分块、
                   坏扇区重试/填充溯源/稀疏洞/人工例外/冻结策略/封存原子性、封存后抽样巡检、
-                  多副本联合巡检；封存后登记文件改写/截断不误报、累计覆盖只算真实成功
-                  读取区间）
+                  多副本联合巡检、修复计划与执行、选择性披露证明；封存后登记文件改写/
+                  截断不误报、累计覆盖只算真实成功读取区间）
 ```

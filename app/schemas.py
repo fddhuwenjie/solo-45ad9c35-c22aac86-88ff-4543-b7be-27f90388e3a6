@@ -1119,3 +1119,211 @@ class DiffReport(ForensicModel):
     unrecovered_sectors_right: int = 0
     accepted_sectors_left: int = 0
     accepted_sectors_right: int = 0
+
+
+# ------------------------------------------- selective disclosure proofs ----
+# A court or external reviewer often needs to verify a few chunks only and
+# must not receive the whole image for that. A selective disclosure proof
+# binds individually delivered chunks to the Merkle root frozen at sealing
+# time: for every disclosed leaf the service emits its leaf index, the
+# left/right sibling digests on the way up and every odd-node promotion
+# step, so the verifier recomputes the frozen root from the leaf digest and
+# the proof path alone. Proofs can be selected by chunk_id or by sector
+# ranges that line up EXACTLY with effective chunk boundaries; the frozen
+# manifest revision, the evidence package digest, the Merkle algorithm
+# specification and the adopted leaf ordering are pinned into every proof,
+# and every issuance is an append-only record carrying the request scope,
+# the covered ranges and the per-leaf selection rationale.
+DISCLOSURE_FORMAT = "split-image-selective-disclosure/v1"
+DISCLOSURE_LEAF_ORDERING = (
+    "effective chunk leaves in reconstructed offset order: "
+    "ordered_chunk_ids of the sealed manifest, leaf i hashes chunk bytes "
+    "sha256(chunk content) as declared in the sealed manifest"
+)
+
+
+class DisclosureProofStep(ForensicModel):
+    """One level of a Merkle inclusion proof.
+
+    ``hash`` steps name the sibling side and carry its hex digest; an
+    ``odd_promotion`` step (``position`` = ``promoted``) records that the
+    lone node at a level was promoted unchanged, so an external verifier
+    can reproduce the odd-node rule without knowing the leaf count.
+    """
+
+    level: int = Field(ge=0, description="0-based level the step starts at")
+    position: Literal["left", "right", "promoted"]
+    sibling_digest: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="Hex digest of the sibling; required for hash steps, "
+                    "absent for an odd-node promotion")
+    result_digest: str = Field(pattern=HEX64,
+                               description="Node digest after applying the step")
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "DisclosureProofStep":
+        if self.position == "promoted":
+            if self.sibling_digest:
+                raise ValueError("an odd-node promotion step carries no "
+                                 "sibling digest")
+        elif not self.sibling_digest:
+            raise ValueError("a hash step must carry its sibling digest")
+        return self
+
+
+class DisclosureProofCreate(ForensicModel):
+    """Request a selective disclosure proof against a sealed manifest."""
+
+    proof_id: str = Field(min_length=1,
+                          description="Unique id; proof records are append-only "
+                                      "and an existing id is never overwritten")
+    evidence_package_digest: str = Field(pattern=HEX64,
+                                         description="Digest of the sealed "
+                                                     "evidence package the "
+                                                     "request is bound to")
+    chunk_ids: list[str] = Field(
+        default_factory=list,
+        description="Effective (non-superseded) chunk ids to disclose")
+    sector_ranges: list[SectorInterval] = Field(
+        default_factory=list,
+        description="Sector ranges to disclose; every range must align "
+                    "exactly with effective chunk boundaries and fully "
+                    "contain every chunk it starts inside")
+    requested_by: str = Field(min_length=1)
+    reason: str = Field(min_length=1,
+                        description="Why exactly these chunks are disclosed "
+                                    "(frozen into the append-only record)")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "DisclosureProofCreate":
+        if not self.chunk_ids and not self.sector_ranges:
+            raise ValueError("a disclosure request must select at least one "
+                             "chunk_id or sector range")
+        if any(not cid or not cid.strip() for cid in self.chunk_ids):
+            raise ValueError("chunk_ids must not contain empty identifiers")
+        if len(set(self.chunk_ids)) != len(self.chunk_ids):
+            raise ValueError("chunk_ids must not contain duplicates")
+        seen: set[tuple[int, int]] = set()
+        for rng in self.sector_ranges:
+            if rng.start_sector < 0:
+                raise ValueError("sector range start_sector must be >= 0")
+            if rng.end_sector <= rng.start_sector:
+                raise ValueError("sector range end_sector must be greater "
+                                 "than start_sector")
+            key = (rng.start_sector, rng.end_sector)
+            if key in seen:
+                raise ValueError("sector ranges must not contain duplicates")
+            seen.add(key)
+        ordered = sorted(seen)
+        for (a0, a1), (b0, b1) in zip(ordered, ordered[1:]):
+            if b0 < a1:
+                raise ValueError("sector ranges must not overlap")
+        return self
+
+
+class DisclosureLeafOrderingEntry(ForensicModel):
+    """One position in the disclosed leaf ordering."""
+
+    leaf_index: int = Field(ge=0)
+    chunk_id: str
+    start_sector: int
+    end_sector: int
+
+
+class DisclosureLeafProof(ForensicModel):
+    """The inclusion proof for one disclosed leaf."""
+
+    chunk_id: str
+    leaf_index: int
+    leaf_digest: str = Field(pattern=HEX64,
+                             description="SHA-256 of the chunk bytes as frozen "
+                                         "in the sealed manifest")
+    start_sector: int
+    end_sector: int
+    selected_by: list[Literal["chunk_id", "sector_range"]] = Field(
+        description="Which request selectors named this leaf")
+    selection_rationale: str
+    proof_steps: list[DisclosureProofStep]
+
+
+class DisclosureProof(ForensicModel):
+    """Self-describing selective disclosure proof, frozen at issuance time."""
+
+    format: Literal[DISCLOSURE_FORMAT] = DISCLOSURE_FORMAT
+    proof_id: str
+    manifest_id: str
+    media_id: str
+    revision: int
+    evidence_package_digest: str
+    merkle_root: str = Field(pattern=HEX64,
+                             description="Frozen root the proofs recompute to")
+    leaf_ordering_rule: Literal[DISCLOSURE_LEAF_ORDERING] = \
+        DISCLOSURE_LEAF_ORDERING
+    merkle_spec: dict[str, Any]
+    leaf_count: int = Field(ge=1)
+    ordered_leaves: list[DisclosureLeafOrderingEntry] = Field(
+        description="Full leaf ordering of the frozen tree (chunk ids and "
+                    "sector spans; undisclosed leaf digests are not exposed)")
+    request: dict[str, Any] = Field(
+        description="The exact selection request: chunk_ids, sector_ranges, "
+                    "requested_by and reason")
+    covered_sector_ranges: list[SectorInterval] = Field(
+        description="Merged sector coverage of the disclosed leaves")
+    covered_sectors: int
+    total_sectors: int
+    leaf_proofs: list[DisclosureLeafProof]
+    disclosure_digest: Optional[str] = Field(
+        None, pattern=HEX64_OR_EMPTY,
+        description="SHA-256 over canonical JSON of the proof with this "
+                    "field removed")
+    created_at: datetime
+
+
+class DisclosureProofSummary(ForensicModel):
+    proof_id: str
+    manifest_id: str
+    media_id: str
+    revision: int
+    evidence_package_digest: str
+    requested_by: str
+    reason: str
+    leaf_count: int
+    disclosed_chunk_ids: list[str]
+    covered_sector_ranges: list[SectorInterval]
+    covered_sectors: int
+    total_sectors: int
+    disclosure_digest: Optional[str] = None
+    created_at: datetime
+
+
+class DisclosureVerifyRequest(ForensicModel):
+    """Stateless verification of one leaf inclusion proof.
+
+    The frozen root is supplied by the verifying party (e.g. from the sealed
+    evidence package); the service recomputes purely from the leaf digest,
+    the proof path and that root and never consults stored packages.
+    """
+
+    proof_id: Optional[str] = Field(
+        None, description="Optional issuance record for cross-checking; not "
+                          "required for the recomputation")
+    merkle_root: str = Field(pattern=HEX64)
+    chunk_id: Optional[str] = None
+    leaf_index: int = Field(ge=0)
+    leaf_count: int = Field(ge=1)
+    leaf_digest: str = Field(pattern=HEX64)
+    proof_steps: list[DisclosureProofStep]
+
+
+class DisclosureVerifyResult(ForensicModel):
+    valid: bool
+    proof_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+    leaf_index: int
+    leaf_count: int
+    leaf_digest: str
+    merkle_root: str
+    recomputed_root: Optional[str] = None
+    error_code: Optional[str] = None
+    error: Optional[str] = None

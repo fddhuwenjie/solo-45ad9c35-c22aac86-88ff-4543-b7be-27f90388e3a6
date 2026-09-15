@@ -17,6 +17,7 @@ from .content import ContentResolver, FilesystemContentResolver
 from .db import (
     configure,
     get_db,
+    get_disclosure_proof_by_id,
     get_inspection,
     get_inspection_by_id,
     get_joint_inspection,
@@ -27,12 +28,14 @@ from .db import (
     get_repair_execution_by_id,
     get_repair_plan,
     get_repair_plan_by_id,
+    insert_disclosure_proof,
     insert_inspection,
     insert_joint_binding,
     insert_joint_inspection,
     insert_manifest,
     insert_repair_execution,
     insert_repair_plan,
+    list_disclosure_proofs,
     list_inspections,
     list_joint_bindings,
     list_joint_inspections,
@@ -43,6 +46,11 @@ from .db import (
     mark_sealed,
     save_precheck,
     utcnow_iso,
+)
+from .disclosure import (
+    DisclosureError,
+    build_disclosure_proof,
+    evaluate_verification,
 )
 from .evidence import (
     build_evidence_package,
@@ -64,6 +72,11 @@ from .recovery import analyze_recovery
 from .repair import evaluate_repair_execution, evaluate_repair_plan
 from .schemas import (
     DiffReport,
+    DisclosureProof,
+    DisclosureProofCreate,
+    DisclosureProofSummary,
+    DisclosureVerifyRequest,
+    DisclosureVerifyResult,
     EvaluationReport,
     Finding,
     InspectionCreate,
@@ -120,7 +133,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Split-Image Forensic Evidence Verification API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Verify segmented disk acquisitions: sector coverage by offset, "
         "chunk-order reconstruction, SHA-256/Merkle roots, write-protector "
@@ -138,7 +151,12 @@ app = FastAPI(
         "draw replacement bytes only from replicas that matched the sealed "
         "baseline on the same interval with complete evidence, and register "
         "the repaired medium as a derived replica only after its recomputed "
-        "whole-disk SHA-256 and Merkle root match the sealed image."
+        "whole-disk SHA-256 and Merkle root match the sealed image. "
+        "Selective disclosure proofs bind individually delivered chunks to "
+        "the sealed Merkle root (leaf index, sibling digests and odd-node "
+        "promotions), selected by chunk id or by ranges aligned exactly with "
+        "effective chunk boundaries, with an append-only issuance record and "
+        "a stateless recomputation endpoint."
     ),
     lifespan=lifespan,
 )
@@ -998,6 +1016,123 @@ def list_manifest_repair_replicas(manifest_id: str,
         raise HTTPException(404, f"manifest {manifest_id} not found")
     return [RepairDerivedReplica.model_validate(json.loads(r["record_json"]))
             for r in list_repair_derived_replicas(conn, manifest_id)]
+
+
+# ----------------------------- selective disclosure proofs (append-only) ----
+def _disclosure_summary_row(row: sqlite3.Row) -> DisclosureProofSummary:
+    proof = DisclosureProof.model_validate(json.loads(row["proof_json"]))
+    return DisclosureProofSummary(
+        proof_id=proof.proof_id, manifest_id=proof.manifest_id,
+        media_id=proof.media_id, revision=proof.revision,
+        evidence_package_digest=proof.evidence_package_digest,
+        requested_by=row["requested_by"], reason=row["reason"],
+        leaf_count=proof.leaf_count,
+        disclosed_chunk_ids=[lp.chunk_id for lp in proof.leaf_proofs],
+        covered_sector_ranges=proof.covered_sector_ranges,
+        covered_sectors=proof.covered_sectors,
+        total_sectors=proof.total_sectors,
+        disclosure_digest=proof.disclosure_digest,
+        created_at=proof.created_at)
+
+
+@app.post("/manifests/{manifest_id}/disclosure-proofs",
+          response_model=DisclosureProof, status_code=201)
+def create_disclosure_proof(manifest_id: str,
+                            payload: DisclosureProofCreate,
+                            conn: sqlite3.Connection = Depends(get_db)):
+    """Issue selective Merkle inclusion proofs for chunks of a sealed image.
+
+    The request must cite the sealed manifest and the exact
+    ``evidence_package_digest`` of the sealed package, and select effective
+    leaves by ``chunk_id`` and/or by sector ranges that line up EXACTLY with
+    valid chunk boundaries. For every disclosed leaf the proof freezes its
+    leaf index, the left/right sibling digests on each level and every
+    odd-node promotion step, plus the pinned manifest revision, the Merkle
+    algorithm specification and the adopted leaf ordering. The request
+    scope, covered ranges and per-leaf selection rationale are written to
+    an append-only record; an existing proof_id is never overwritten (409).
+    Correction-superseded chunks, boundary-crossing or out-of-medium ranges,
+    duplicate leaves and a mismatched evidence package digest refuse the
+    request — no proof is issued on any such error.
+    """
+    row = get_manifest(conn, manifest_id)
+    if row is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    if row["status"] != "sealed":
+        raise HTTPException(409, detail={
+            "code": "DISCLOSURE_REQUIRES_SEALED",
+            "message": "selective disclosure proofs are anchored in the "
+                       "frozen Merkle root of a sealed manifest; manifest "
+                       f"{manifest_id} is '{row['status']}'",
+            "status": row["status"]})
+    if get_disclosure_proof_by_id(conn, payload.proof_id) is not None:
+        raise HTTPException(409, detail={
+            "code": "DISCLOSURE_PROOF_DUPLICATE",
+            "message": f"disclosure proof {payload.proof_id} already exists; "
+                       "proof records are append-only and a re-request must "
+                       "use a new proof_id",
+            "proof_id": payload.proof_id})
+    sealed_payload = payload_from_row(row)
+    sealed_report = report_from_json(row["seal_report_json"])
+    if sealed_report is None:
+        raise HTTPException(500, detail={
+            "code": "DISCLOSURE_SEALED_REPORT_MISSING",
+            "message": "sealed manifest has no stored seal report"})
+    package = build_evidence_package(row, sealed_report)
+    if package["evidence_package_digest"] != payload.evidence_package_digest:
+        raise HTTPException(422, detail={
+            "code": "DISCLOSURE_EVIDENCE_PACKAGE_MISMATCH",
+            "message": "the cited evidence_package_digest does not match the "
+                       "digest of the sealed evidence package; a proof can "
+                       "only be anchored to the package frozen at sealing time",
+            "submitted_digest": payload.evidence_package_digest,
+            "sealed_digest": package["evidence_package_digest"]})
+    try:
+        proof = build_disclosure_proof(
+            request=payload, manifest_row=row,
+            sealed_payload=sealed_payload,
+            ordered_chunk_ids=sealed_report.ordered_chunk_ids,
+            frozen_root=sealed_report.merkle_root,
+            evidence_package_digest=payload.evidence_package_digest,
+            created_at=utcnow_iso())
+    except DisclosureError as exc:
+        raise HTTPException(exc.status_code, detail=exc.detail)
+    insert_disclosure_proof(conn, proof, payload)
+    return proof
+
+
+@app.get("/manifests/{manifest_id}/disclosure-proofs",
+         response_model=list[DisclosureProofSummary])
+def list_manifest_disclosure_proofs(manifest_id: str,
+                                    conn: sqlite3.Connection = Depends(get_db)):
+    if get_manifest(conn, manifest_id) is None:
+        raise HTTPException(404, f"manifest {manifest_id} not found")
+    return [_disclosure_summary_row(r)
+            for r in list_disclosure_proofs(conn, manifest_id)]
+
+
+@app.get("/manifests/{manifest_id}/disclosure-proofs/{proof_id}",
+         response_model=DisclosureProof)
+def read_disclosure_proof(manifest_id: str, proof_id: str,
+                          conn: sqlite3.Connection = Depends(get_db)):
+    row = get_disclosure_proof_by_id(conn, proof_id)
+    if row is None or row["manifest_id"] != manifest_id:
+        raise HTTPException(404, f"disclosure proof {proof_id} not found for "
+                                 f"manifest {manifest_id}")
+    return DisclosureProof.model_validate(json.loads(row["proof_json"]))
+
+
+@app.post("/disclosure/verify", response_model=DisclosureVerifyResult)
+def verify_disclosure_proof(payload: DisclosureVerifyRequest):
+    """Recompute one leaf inclusion proof purely from the leaf digest, the
+    proof path and the caller-supplied frozen Merkle root.
+
+    No manifest, evidence package, database or chunk bytes are consulted;
+    mismatched root, a path that never closes to a single node, a wrong
+    sibling side for the leaf position or a wrong promotion step all return
+    ``valid=false`` with an explicit error code.
+    """
+    return evaluate_verification(payload)
 
 
 @app.get("/media/{media_id}", response_model=MediaRecord)
